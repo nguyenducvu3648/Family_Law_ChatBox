@@ -21,3 +21,6 @@ pydantic>=2.5.1
 
 # -------------------- Utilities --------------------
 uuid>=1.30
+tenacity>=8.2.2
+rank-bm25>=0.2.2
+transformers>=4.34.0
