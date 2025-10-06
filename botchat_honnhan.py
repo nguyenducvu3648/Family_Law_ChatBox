@@ -4,7 +4,6 @@ import re
 import json
 import time
 import logging
-import asyncio
 from datetime import datetime
 from textwrap import dedent
 from typing import List, Dict, Any, Optional, Tuple
@@ -41,8 +40,8 @@ if not (QDRANT_URL and QDRANT_API_KEY):
     raise RuntimeError("Thiếu QDRANT_URL hoặc QDRANT_API_KEY trong tệp .env")
 
 # Load BAAI reranker (nên load global)
-rerank_tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-reranker-large")
-rerank_model = AutoModelForSequenceClassification.from_pretrained("BAAI/bge-reranker-large")
+rerank_tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-reranker-base")
+rerank_model = AutoModelForSequenceClassification.from_pretrained("BAAI/bge-reranker-base")
 rerank_model.eval()
 
 def rerank_with_baai(query, docs, top_k=15):
@@ -310,44 +309,8 @@ def analyze_intent(query: str) -> Dict[str, Any]:
         "filters": filters,
     }
 
-# ================== TÌM KIẾM BM25 ==================
 def tokenize(text):
     return re.findall(r'\w+', text.lower())
-
-@log_time
-def rank_by_bm25(docs: list, query: str):
-    corpus = [tokenize(d['content']) for d in docs]
-    bm25 = BM25Okapi(corpus)
-    tokenized_query = tokenize(query)
-    scores = bm25.get_scores(tokenized_query)
-    for d, s in zip(docs, scores):
-        d['bm25_score'] = float(s)
-    ranked_docs = sorted(docs, key=lambda x: x['bm25_score'], reverse=True)
-    return ranked_docs
-
-@log_time
-def rerank_bm25(query: str, docs: list) -> list:
-    corpus = [d.get("content", "") for d in docs]
-    if not corpus:
-        return docs
-
-    bm25 = BM25Okapi([doc.split() for doc in corpus])
-    scores = bm25.get_scores(query.split())
-
-    for d, s in zip(docs, scores):
-        d["bm25_score"] = float(s)
-
-    reranked = sorted(docs, key=lambda x: x["bm25_score"], reverse=True)
-
-    print("DEBUG: Kết quả sắp xếp lại BM25:")
-    for i, d in enumerate(reranked, 1):
-        print(
-            f"  {i}. Điểm BM25={d['bm25_score']:.4f}, "
-            f"Điểm gốc={d.get('score', 0.0):.4f}, "
-            f"Nội dung xem trước={d['content'][:50]}..."
-        )
-
-    return reranked
 
 # Load all documents at startup for global BM25
 def load_all_docs():
@@ -449,7 +412,7 @@ async def search_law(query: str, top_k: int = 15, score_threshold: float = 0.42)
 
             tokenized_query = tokenize(query)
             bm25_scores = bm25.get_scores(tokenized_query)
-            scored_indices = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:50]
+            scored_indices = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:20]
             bm25_docs = []
             for idx in scored_indices:
                 if bm25_scores[idx] > 0:  # Optional threshold
@@ -474,7 +437,7 @@ async def search_law(query: str, top_k: int = 15, score_threshold: float = 0.42)
                 collection_name=COLLECTION_NAME,
                 query=vec,
                 with_payload=True,
-                limit=50,
+                limit=20,
                 query_filter=flt,
             )
             t_qdrant = time.perf_counter() - t_q0
@@ -528,7 +491,7 @@ async def search_law(query: str, top_k: int = 15, score_threshold: float = 0.42)
         merged_docs = list(all_unique.values())
         print(f"DEBUG: Sau merge, số unique docs: {len(merged_docs)}")
 
-        # Weighted Hybrid Scoring
+        # Weighted Hybrid Scoring (rerank lần đầu)
         print(f"DEBUG: Bắt đầu weighted hybrid scoring, alpha={0.7 if has_filter else 0.5}, beta={0.3 if has_filter else 0.5}")
         t_rerank0 = time.perf_counter()
         if merged_docs:
@@ -567,7 +530,7 @@ async def search_law(query: str, top_k: int = 15, score_threshold: float = 0.42)
                 d.pop('embedding_score', None)
                 d.pop('bm25_score', None)
 
-            # Chỉ lấy 40 docs để tối ưu trước khi BAAI rerank
+            # Lấy top 15 sau hybrid rerank và filter threshold
             selected = [d for d in ranked if d['score'] >= score_threshold][:15]
         else:
             selected = []
@@ -575,13 +538,13 @@ async def search_law(query: str, top_k: int = 15, score_threshold: float = 0.42)
         print(f"DEBUG: Hoàn tất weighted hybrid, số selected docs: {len(selected)}, thời gian: {t_rerank:.4f}s")
 
         # =========================
-        # BAAI Rerank step
+        # BAAI Rerank step (rerank lần 2)
         # =========================
         t_baai0 = time.perf_counter()
         if selected:
-            print("DEBUG: Bắt đầu rerank bằng BAAI/bge-reranker-large")
-            # Rerank chỉ top 15 docs
-            selected = rerank_with_baai(query, selected, top_k=top_k)
+            print("DEBUG: Bắt đầu rerank bằng BAAI/bge-reranker-base")
+            # Rerank chỉ top 15 docs, lấy top 7 tốt nhất
+            selected = rerank_with_baai(query, selected, top_k=7)
             print("DEBUG: Hoàn tất rerank bằng BAAI, top1 score:", selected[0].get("baai_score"))
         t_baai = time.perf_counter() - t_baai0
         print(f"DEBUG: Thời gian rerank BAAI: {t_baai:.4f}s")
@@ -607,7 +570,7 @@ async def search_law(query: str, top_k: int = 15, score_threshold: float = 0.42)
         app_log.info(
             "Tìm kiếm hoàn tất",
             extra={"__kv__": {"so_luong": len(selected), "diem_top1": f"{sk_top1:.4f}"}})
-        return selected
+        return bm25_docs, emb_docs, selected
     except Exception as e:
         app_log.error("Lỗi tìm kiếm", extra={"__kv__": {"loi": str(e)}})
         log_step("tim_kiem_loi", thong_bao=str(e))
@@ -818,17 +781,19 @@ def _fetch(filters: Dict[str, Any], limit: int = 10):
     return out
 
 # ================== HÀM HỖ TRỢ GIAO DIỆN ==================
-def ui_return(msg_val, chatbot_val, cites_val, last_answer_val, docs_val, page_val, page_label_val, history_val):
-    print("DEBUG: Gọi hàm ui_return, trả về 8 giá trị")
+def ui_return(msg_val, chatbot_val, bm25_val, emb_val, cites_val, last_answer_val, docs_val, page_val, page_label_val, history_msgs):
+    print("DEBUG: Gọi hàm ui_return, trả về 10 giá trị")
     return (
         msg_val,
         chatbot_val,
+        gr.update(value=bm25_val),
+        gr.update(value=emb_val),
         gr.update(value=cites_val),
         last_answer_val,
         docs_val,
         page_val,
         page_label_val,
-        history_val,
+        history_msgs,
     )
 
 # ================== GIAO DIỆN NGƯỜI DÙNG ==================
@@ -843,8 +808,13 @@ label { font-size:12px !important; opacity:.9 }
     border-radius: 6px;
     background-color: #fafafa;
 }
-#history_box {
+#bm25-box, #emb-box {
     max-height: 200px;
+    overflow-y: auto;
+    border: 1px solid #ddd;
+    padding: 6px;
+    border-radius: 6px;
+    background-color: #fafafa;
 }
 """
 
@@ -853,7 +823,7 @@ with gr.Blocks(
     css=CSS,
 ) as demo:
     gr.Markdown("""
-    ### ⚖️ Trợ lý Luật Hôn Nhân & Gia Đình 2014
+    ### ⚖️ Trợ lý Luật Hôn Nhân & Gia đình 2014
     *Tham chiếu chính xác • Hạn chế suy diễn • Không thay thế tư vấn pháp lý*
     """)
 
@@ -870,13 +840,11 @@ with gr.Blocks(
                 ex2 = gr.Button("Điều 81 quy định gì về việc nuôi con sau ly hôn")
                 ex3 = gr.Button("Khoản 2 Điều 56 nói gì")
         with gr.Column(scale=5):
-            history_box = gr.Chatbot(
-                value=[],
-                type="messages",
-                show_copy_button=False,
-                label="📜 Lịch sử chat",
-                elem_id="history_box",
-            )
+            gr.Markdown("**📜 Kết quả BM25**")
+            bm25_md = gr.Markdown(value="(Chưa có dữ liệu)", elem_id="bm25-box")
+            
+            gr.Markdown("**📜 Kết quả Embedding Search**")
+            emb_md = gr.Markdown(value="(Chưa có dữ liệu)", elem_id="emb-box")
             gr.Markdown("**Cơ sở pháp lý**")
             cites_md = gr.Markdown(value="(Chưa có dữ liệu)", elem_id="cites-box")
             with gr.Row():
@@ -919,6 +887,8 @@ with gr.Blocks(
             return ui_return(
                 gr.update(),
                 history_msgs,
+                "",
+                "",
                 "",
                 "",
                 [],
@@ -973,6 +943,8 @@ with gr.Blocks(
                         gr.update(value=""),
                         history_msgs,
                         "(Không có trích dẫn)",
+                        "(Không có trích dẫn)",
+                        "(Không có trích dẫn)",
                         final_answer,
                         [],
                         1,
@@ -995,6 +967,8 @@ with gr.Blocks(
                     gr.update(value=""),
                     history_msgs,
                     "(Không có trích dẫn)",
+                    "(Không có trích dẫn)",
+                    "(Không có trích dẫn)",
                     acc,
                     [],
                     1,
@@ -1004,6 +978,8 @@ with gr.Blocks(
 
             # Xử lý câu hỏi tìm kiếm luật hoặc trả lời pháp lý
             docs: List[Dict[str, Any]] = []
+            bm25_docs: List[Dict[str, Any]] = []
+            emb_docs: List[Dict[str, Any]] = []
             source = None
 
             if intent == "law_search":
@@ -1015,12 +991,12 @@ with gr.Blocks(
                         "Rơi vào tìm kiếm embedding",
                         extra={"__kv__": {"cau_hoi": message}},
                     )
-                    docs = await search_law(message, top_k=int(k), score_threshold=float(threshold))
+                    bm25_docs, emb_docs, docs = await search_law(message, top_k=int(k), score_threshold=float(threshold))
                     source = "law_search_embedding_fallback"
 
             elif intent == "legal_answer":
                 print("DEBUG: Tìm kiếm câu trả lời pháp lý")
-                docs = await search_law(normalized_query, top_k=int(k), score_threshold=float(threshold))
+                bm25_docs, emb_docs, docs = await search_law(normalized_query, top_k=int(k), score_threshold=float(threshold))
                 source = "legal_answer"
 
             else:
@@ -1033,6 +1009,8 @@ with gr.Blocks(
                 return ui_return(
                     gr.update(value=""),
                     history_msgs,
+                    "(Không có trích dẫn)",
+                    "(Không có trích dẫn)",
                     "(Không có trích dẫn)",
                     reply,
                     [],
@@ -1055,6 +1033,8 @@ with gr.Blocks(
                     gr.update(value=""),
                     upd,
                     "(Chưa có dữ liệu)",
+                    "(Chưa có dữ liệu)",
+                    "(Chưa có dữ liệu)",
                     reply,
                     [],
                     1,
@@ -1068,6 +1048,8 @@ with gr.Blocks(
                 user_query = message
             else:
                 user_query = message
+            bm25_markdown = docs_to_markdown(bm25_docs)
+            emb_markdown = docs_to_markdown(emb_docs)
             cites_markdown, page_label = docs_page_markdown(docs, 1, int(cur_page_size))
             prompt = build_prompt(user_query, docs, history_msgs)
 
@@ -1088,6 +1070,8 @@ with gr.Blocks(
             return ui_return(
                 gr.update(value=""),
                 history_msgs,
+                bm25_markdown,
+                emb_markdown,
                 cites_markdown,
                 acc,
                 docs,
@@ -1102,6 +1086,8 @@ with gr.Blocks(
             return ui_return(
                 gr.update(value=""),
                 history_msgs,
+                "(Lỗi hệ thống)",
+                "(Lỗi hệ thống)",
                 "(Lỗi hệ thống)",
                 f"Lỗi: {e}",
                 [],
@@ -1123,6 +1109,8 @@ with gr.Blocks(
     outputs = [
         msg,
         chatbot,
+        bm25_md,
+        emb_md,
         cites_md,
         state_last_answer,
         state_docs,
