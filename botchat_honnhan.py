@@ -782,6 +782,7 @@ def _fetch(filters: Dict[str, Any], limit: int = 10):
 
 # ================== HÀM HỖ TRỢ GIAO DIỆN ==================
 def ui_return(msg_val, chatbot_val, bm25_val, emb_val, cites_val, last_answer_val, docs_val, page_val, page_label_val, history_msgs):
+    """Helper function đảm bảo luôn trả về đúng 10 giá trị"""
     print("DEBUG: Gọi hàm ui_return, trả về 10 giá trị")
     return (
         msg_val,
@@ -834,6 +835,7 @@ with gr.Blocks(
                 type="messages",
                 show_copy_button=True,
                 elem_id="chatbot",
+                autoscroll=True,
             )
             with gr.Row():
                 ex1 = gr.Button("Chào bạn")
@@ -855,7 +857,7 @@ with gr.Blocks(
                 page_size = gr.Slider(3, 20, value=5, step=1, label="Mỗi trang")
 
     with gr.Row():
-        msg = gr.Textbox(placeholder="Nhập câu hỏi...", scale=5, autofocus=True)
+        msg = gr.Textbox(placeholder="Nhập câu hỏi...", scale=5, autofocus=False)
         send = gr.Button("Gửi", variant="primary", scale=1)
         clear = gr.Button("Làm mới", scale=1)
 
@@ -876,16 +878,16 @@ with gr.Blocks(
     state_docs = gr.State([])
     state_page = gr.State(1)
 
-    # -------- Xử lý chính (Async Generator) --------
+    # -------- GENERATOR CHÍNH - Xử lý logic và yield từng chunk --------
     @log_time
-    async def respond_async(message, history_msgs, cur_page_size, k=15, temperature=0.2, threshold=0.42):
-        """Async version - giữ nguyên logic xử lý song song"""
+    def respond_generator(message, history_msgs, cur_page_size, k=15, temperature=0.2, threshold=0.42):
+        """Generator function - yield từng update dần dần (sync wrapper cho async code)"""
         print(f"DEBUG: Bắt đầu xử lý câu hỏi: {message}")
         if not (message and message.strip()):
             print("DEBUG: Câu hỏi rỗng, trả về mặc định")
             gr.Info("Vui lòng nhập câu hỏi.")
-            return ui_return(
-                gr.update(),
+            yield ui_return(
+                gr.update(value=""),
                 history_msgs,
                 "",
                 "",
@@ -896,6 +898,7 @@ with gr.Blocks(
                 " Trang 0/0",
                 history_msgs,
             )
+            return
 
         t_overall0 = time.perf_counter()
         try:
@@ -909,7 +912,7 @@ with gr.Blocks(
             original_query = intent_info.get("original_query", message)
             intent_filters = intent_info.get("filters", {})
 
-            # Xử lý câu hỏi xã giao
+            # ========== XỬ LÝ CÂU HỎI XÃ GIAO ==========
             if intent == "casual":
                 final_answer = (intent_answer or "").replace("\u200b", "").strip()
                 app_log.info(
@@ -933,13 +936,14 @@ with gr.Blocks(
                         )
                         final_answer = truncated
 
+                # Nếu có câu trả lời trực tiếp từ intent
                 if len(final_answer) >= 1:
                     history_msgs = history_msgs + [
                         {"role": "user", "content": message},
                         {"role": "assistant", "content": final_answer},
                     ]
                     print("DEBUG: Trả về câu trả lời xã giao trực tiếp")
-                    return ui_return(
+                    yield ui_return(
                         gr.update(value=""),
                         history_msgs,
                         "(Không có trích dẫn)",
@@ -951,7 +955,9 @@ with gr.Blocks(
                         " Trang 0/0",
                         history_msgs,
                     )
+                    return
 
+                # Stream câu trả lời xã giao
                 simple_prompt = "Trả lời thân thiện ngắn gọn (<=2 câu) tiếng Việt cho câu: " + message
                 history_msgs = history_msgs + [
                     {"role": "user", "content": message},
@@ -959,11 +965,9 @@ with gr.Blocks(
                 ]
                 acc = ""
                 print("DEBUG: Bắt đầu stream câu trả lời xã giao")
-                for chunk in stream_answer(simple_prompt, temperature=float(temperature)):
-                    acc += chunk
-                    history_msgs[-1]["content"] = acc
-                print("DEBUG: Trả về kết quả stream câu trả lời xã giao")
-                return ui_return(
+                
+                # Yield initial state
+                yield ui_return(
                     gr.update(value=""),
                     history_msgs,
                     "(Không có trích dẫn)",
@@ -975,8 +979,48 @@ with gr.Blocks(
                     " Trang 0/0",
                     history_msgs,
                 )
+                
+                # Stream từng chunk
+                buffer = ""
+                for chunk in stream_answer(simple_prompt, temperature=float(temperature)):
+                    buffer += chunk
+                    if len(buffer) >= 50:  # Tích lũy 50 ký tự mới yield
+                        acc += buffer
+                        history_msgs[-1]["content"] = acc
+                        yield ui_return(
+                            gr.update(value=""),
+                            history_msgs,
+                            "(Không có trích dẫn)",
+                            "(Không có trích dẫn)",
+                            "(Không có trích dẫn)",
+                            acc,
+                            [],
+                            1,
+                            " Trang 0/0",
+                            history_msgs,
+                        )
+                        buffer = ""
+                
+                # Yield phần còn lại
+                if buffer:
+                    acc += buffer
+                    history_msgs[-1]["content"] = acc
+                    yield ui_return(
+                        gr.update(value=""),
+                        history_msgs,
+                        "(Không có trích dẫn)",
+                        "(Không có trích dẫn)",
+                        "(Không có trích dẫn)",
+                        acc,
+                        [],
+                        1,
+                        " Trang 0/0",
+                        history_msgs,
+                    )
+                print("DEBUG: Hoàn thành stream câu trả lời xã giao")
+                return
 
-            # Xử lý câu hỏi tìm kiếm luật hoặc trả lời pháp lý
+            # ========== XỬ LÝ CÂU HỎI PHÁP LÝ ==========
             docs: List[Dict[str, Any]] = []
             bm25_docs: List[Dict[str, Any]] = []
             emb_docs: List[Dict[str, Any]] = []
@@ -991,12 +1035,29 @@ with gr.Blocks(
                         "Rơi vào tìm kiếm embedding",
                         extra={"__kv__": {"cau_hoi": message}},
                     )
-                    bm25_docs, emb_docs, docs = await search_law(message, top_k=int(k), score_threshold=float(threshold))
+                    # Gọi async function trong sync context - dùng nest_asyncio
+                    try:
+                        loop = asyncio.get_event_loop()
+                    except RuntimeError:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                    
+                    bm25_docs, emb_docs, docs = loop.run_until_complete(
+                        search_law(message, top_k=int(k), score_threshold=float(threshold))
+                    )
                     source = "law_search_embedding_fallback"
 
             elif intent == "legal_answer":
                 print("DEBUG: Tìm kiếm câu trả lời pháp lý")
-                bm25_docs, emb_docs, docs = await search_law(normalized_query, top_k=int(k), score_threshold=float(threshold))
+                # Gọi async function trong sync context
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    bm25_docs, emb_docs, docs = loop.run_until_complete(
+                        search_law(normalized_query, top_k=int(k), score_threshold=float(threshold))
+                    )
+                finally:
+                    loop.close()
                 source = "legal_answer"
 
             else:
@@ -1006,7 +1067,7 @@ with gr.Blocks(
                     {"role": "assistant", "content": reply},
                 ]
                 print("DEBUG: Trả về ý định mặc định")
-                return ui_return(
+                yield ui_return(
                     gr.update(value=""),
                     history_msgs,
                     "(Không có trích dẫn)",
@@ -1018,6 +1079,7 @@ with gr.Blocks(
                     " Trang 0/0",
                     history_msgs,
                 )
+                return
 
             if not docs:
                 reply = (
@@ -1029,7 +1091,7 @@ with gr.Blocks(
                     {"role": "assistant", "content": reply},
                 ]
                 print("DEBUG: Không tìm thấy tài liệu")
-                return ui_return(
+                yield ui_return(
                     gr.update(value=""),
                     upd,
                     "(Chưa có dữ liệu)",
@@ -1041,13 +1103,16 @@ with gr.Blocks(
                     " Trang 0/0",
                     upd,
                 )
+                return
 
+            # Chuẩn bị prompt và markdown
             if intent == "legal_answer":
                 user_query = original_query or message
             elif intent == "law_search":
                 user_query = message
             else:
                 user_query = message
+                
             bm25_markdown = docs_to_markdown(bm25_docs)
             emb_markdown = docs_to_markdown(emb_docs)
             cites_markdown, page_label = docs_page_markdown(docs, 1, int(cur_page_size))
@@ -1056,18 +1121,17 @@ with gr.Blocks(
             log_step("llm_chuanbi", so_tai_lieu=len(docs), nguon=source)
             print(f"DEBUG: Đã chuẩn bị prompt, số tài liệu: {len(docs)}")
 
+            # Chuẩn bị history
             history_msgs = history_msgs + [
                 {"role": "user", "content": message},
                 {"role": "assistant", "content": ""},
             ]
             acc = ""
-            t_llm0 = time.perf_counter()
+            
             print("DEBUG: Bắt đầu stream câu trả lời pháp lý")
-            for chunk in stream_answer(prompt, temperature=float(temperature)):
-                acc += chunk
-                history_msgs[-1]["content"] = acc
-            print("DEBUG: Trả về kết quả stream câu trả lời pháp lý")
-            return ui_return(
+            
+            # Yield initial state với các markdown
+            yield ui_return(
                 gr.update(value=""),
                 history_msgs,
                 bm25_markdown,
@@ -1079,11 +1143,51 @@ with gr.Blocks(
                 page_label,
                 history_msgs,
             )
+            
+            # Stream từng chunk
+            buffer = ""
+            for chunk in stream_answer(prompt, temperature=float(temperature)):
+                buffer += chunk
+                if len(buffer) >= 50:  # Tích lũy 50 ký tự mới yield
+                    acc += buffer
+                    history_msgs[-1]["content"] = acc
+                    yield ui_return(
+                        gr.update(value=""),
+                        history_msgs,
+                        bm25_markdown,
+                        emb_markdown,
+                        cites_markdown,
+                        acc,
+                        docs,
+                        1,
+                        page_label,
+                        history_msgs,
+                    )
+                    buffer = ""
+            
+            # Yield phần còn lại
+            if buffer:
+                acc += buffer
+                history_msgs[-1]["content"] = acc
+                yield ui_return(
+                    gr.update(value=""),
+                    history_msgs,
+                    bm25_markdown,
+                    emb_markdown,
+                    cites_markdown,
+                    acc,
+                    docs,
+                    1,
+                    page_label,
+                    history_msgs,
+                )
+            print("DEBUG: Hoàn thành stream câu trả lời pháp lý")
+            return
 
         except Exception as e:
             app_log.error("Lỗi xử lý câu hỏi", extra={"__kv__": {"loi": str(e)}})
             print(f"DEBUG: Lỗi trong xử lý: {e}")
-            return ui_return(
+            yield ui_return(
                 gr.update(value=""),
                 history_msgs,
                 "(Lỗi hệ thống)",
@@ -1095,31 +1199,32 @@ with gr.Blocks(
                 " Trang 0/0",
                 history_msgs,
             )
+            return
 
+    # -------- WRAPPER ĐỒNG BỘ - Gradio gọi hàm này --------
+    def respond_wrapper(message, history_msgs, cur_page_size, k=15, temperature=0.2, threshold=0.42):
+        """Wrapper để Gradio gọi - chuyển tiếp từ generator"""
+        for output in respond_generator(message, history_msgs, cur_page_size, k, temperature, threshold):
+            yield output
 
-    # Wrapper đồng bộ cho Gradio
-    def respond(message, history_msgs, cur_page_size, k=15, temperature=0.2, threshold=0.42):
-        """Sync wrapper - Gradio sẽ gọi hàm này"""
-        return asyncio.run(
-            respond_async(message, history_msgs, cur_page_size, k, temperature, threshold)
-        )
-
-
-    # Kết nối outputs
+    # Kết nối outputs (10 giá trị)
     outputs = [
-        msg,
-        chatbot,
-        bm25_md,
-        emb_md,
-        cites_md,
-        state_last_answer,
-        state_docs,
-        state_page,
-        page_info,
-        state_history,
+        msg,                  # 1
+        chatbot,              # 2
+        bm25_md,              # 3
+        emb_md,               # 4
+        cites_md,             # 5
+        state_last_answer,    # 6
+        state_docs,           # 7
+        state_page,           # 8
+        page_info,            # 9
+        state_history,        # 10
     ]
-    send.click(respond, inputs=[msg, state_history, page_size], outputs=outputs, queue=False)
-    msg.submit(respond, inputs=[msg, state_history, page_size], outputs=outputs, queue=False)
+    
+    # Kết nối với wrapper (BẬT queue=True để hỗ trợ streaming)
+    send.click(respond_wrapper, inputs=[msg, state_history, page_size], outputs=outputs, queue=True)
+    msg.submit(respond_wrapper, inputs=[msg, state_history, page_size], outputs=outputs, queue=True)
+
     # Like/Dislike
     def on_like(data: gr.LikeData):
         msg_like = data.value or {}
