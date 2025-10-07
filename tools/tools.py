@@ -1,0 +1,65 @@
+import re
+import torch
+from typing import List
+from rank_bm25 import BM25Okapi
+from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+
+from core.config import EMBEDDING_MODEL
+from models.models import rerank_model, rerank_tokenizer
+from utils.utils import _safe_truncate
+
+from memory.cache import embed_cache, search_cache
+
+from models.models import embedder
+
+def rerank_with_baai(query, docs, top_k=15):
+    if not docs:
+        return docs
+
+    pairs = [(query, d["content"]) for d in docs]
+    inputs = rerank_tokenizer(
+        [p[0] for p in pairs],
+        [p[1] for p in pairs],
+        padding=True,
+        truncation=True,
+        return_tensors="pt",
+        max_length=512
+    )
+
+    with torch.no_grad():
+        scores = rerank_model(**inputs).logits.view(-1).float()
+
+    # Gắn lại score vào docs
+    for d, s in zip(docs, scores):
+        d["baai_score"] = float(s)
+
+    reranked = sorted(docs, key=lambda x: x["baai_score"], reverse=True)
+    return reranked[:top_k]
+
+def tokenize(text):
+    return re.findall(r'\w+', text.lower())
+
+def encode_query(text: str):
+    key = f"{EMBEDDING_MODEL}|query|{text}"
+    v = embed_cache.get(key)
+    if v is not None:
+        return v
+    vec = embedder.encode([f"query: {text}"], normalize_embeddings=True)[0].tolist()
+    embed_cache.set(key, vec)
+    return vec
+
+def _build_filter(query_text: str) -> Filter or None:
+    conds: List[FieldCondition] = []
+    m = re.search(r"(?i)\bđiều\s*(\d+)\b", query_text)
+    if m:
+        conds.append(FieldCondition(key="article_no", match=MatchValue(value=int(m.group(1)))))
+    m = re.search(r"(?i)\bkhoản\s*(\d+)\b", query_text)
+    if m:
+        conds.append(FieldCondition(key="clause_no", match=MatchValue(value=int(m.group(1)))))
+    m = re.search(r"(?i)\bđiểm\s*([a-z])\b", query_text)
+    if m:
+        conds.append(FieldCondition(key="point_letter", match=MatchValue(value=m.group(1).lower())))
+    m = re.search(r"(?i)\bchương\s*(\d+)\b", query_text)
+    if m:
+        conds.append(FieldCondition(key="chapter_number", match=MatchValue(value=int(m.group(1)))))
+    return Filter(must=conds) if conds else None
