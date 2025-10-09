@@ -1,9 +1,30 @@
-gradio
-python-dotenv
-qdrant-client
-sentence-transformers
-google-generativeai
-tqdm
-torch
-pandas
+# -------------------- Core --------------------
+gradio>=3.49.0
+python-dotenv>=1.0.0
+pymongo[srv]>=4.3.3
+certifi>=2023.7.22
+
+# -------------------- LangChain & memory --------------------
+langchain>=0.1.0
+langchain-core>=0.0.200
+
+# -------------------- Qdrant & embeddings --------------------
+qdrant-client>=1.3.0
+sentence-transformers>=2.2.2
+torch>=2.1.0
+
+# -------------------- Google Gemini --------------------
+google-generativeai>=0.8.0
+
+# -------------------- Validation / helper --------------------
+pydantic>=2.5.1
+
+# -------------------- Utilities --------------------
+uuid>=1.30
+tenacity>=8.2.2
+rank-bm25>=0.2.2
+transformers>=4.34.0
+
+
 openpyxl
+python-docx

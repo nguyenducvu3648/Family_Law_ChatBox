@@ -1,7 +1,7 @@
 import json
 import os
-import time
 from typing import List
+from uuid import uuid4
 
 from dotenv import load_dotenv
 from tqdm import tqdm
@@ -60,7 +60,7 @@ def upload_batch(points_batch):
     client.upsert(
         collection_name=COLLECTION_NAME,
         points=points_batch,
-        wait=False  # không chờ đồng bộ
+        wait=True  # chờ index xong để tránh query thiếu
     )
 
 def load_and_upload(json_path: str):
@@ -79,10 +79,15 @@ def load_and_upload(json_path: str):
 
         points = []
         for it, vec in zip(chunk, vectors):
-            payload = {"content": it["content"], **it.get("metadata", {})}
+            meta = it.get("metadata", {})
+            if "point_id" in meta:
+                meta.pop("point_id")   # xóa khỏi payload
+
+            payload = {"content": it["content"], **meta}
+
             points.append(
                 models.PointStruct(
-                    id=global_counter,   # int auto-increment
+                    id=global_counter,   # dùng id tự tăng
                     vector=vec,
                     payload=payload
                 )
@@ -92,6 +97,7 @@ def load_and_upload(json_path: str):
         upload_batch(points)
 
     print("🚀 Hoàn tất upload.")
+
 
 if __name__ == "__main__":
     ensure_collection()
