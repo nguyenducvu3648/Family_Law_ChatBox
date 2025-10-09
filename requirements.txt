@@ -5,3 +5,5 @@ sentence-transformers
 google-generativeai
 tqdm
 torch
+pandas
+openpyxl
