@@ -1,5 +1,6 @@
 from textwrap import dedent
 from typing import List, Dict, Any
+import re
 
 def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None):
     history_block = ""
@@ -12,9 +13,16 @@ def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None):
             lines.append(f"- {i}. {role_label}: {content}")
         history_block = "\nLịch sử hội thoại gần đây:\n" + "\n".join(lines)
 
+    def doc_priority(d):
+        text = (d.get("content") or "").lower()
+        if re.search(r"\b(trừ khi|ngoại lệ|nếu chưa bị tuyên bố|trường hợp|nhưng không)\b", text):
+            return 0  # Ưu tiên cao
+        return 1
+
     docs_sorted = sorted(
         docs,
         key=lambda d: (
+            doc_priority(d),
             int(d.get("article_no") or 9999),
             int(d.get("clause_no") or 9999),
             str(d.get("point_letter") or ""),
@@ -46,13 +54,14 @@ def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None):
     Quy tắc:
     - Câu hỏi Đúng/Sai → trả lời **Kết luận: Đúng/Sai** + lý do.
     - Câu hỏi thường → trả lời **1–3 câu**, bám sát câu hỏi.
-    - **Trích dẫn nguyên văn** điều luật liên quan (Điểm–Khoản–Điều + nội dung), theo thứ tự.
+    - **Trích dẫn nguyên văn** tất cả điều luật liên quan (Điểm–Khoản–Điều + nội dung), theo thứ tự.
     - Nếu thiếu căn cứ → trả lời: **Không đủ căn cứ.**
     - Câu hỏi ngoài luật → trả lời lịch sự, ngắn gọn, không viện dẫn luật.
+    - Nếu có điều kiện ngoại lệ (trừ khi, nếu chưa bị tuyên bố, ngoại lệ...) → phải xét ưu tiên phần đó.
     ĐỊNH DẠNG TRẢ LỜI:
-    - Trích dẫn: <liệt kê toàn bộ Điểm–Khoản–Điều + nội dung>
+    - Trích dẫn: <liệt kê toàn bộ điều luật được sử dụng>
     - Giải thích: <1–3 câu, áp dụng tình huống>
-    - Kết luận: <kết luận ngắn gọn dựa vào câu hỏi và giải thích>
+    - Kết luận: <kết luận ngắn gọn dựa vào câu hỏi, trích dẫn và giải thích>
 
     Câu hỏi hiện tại:
     \"\"\"{query}\"\"\"{history_block}

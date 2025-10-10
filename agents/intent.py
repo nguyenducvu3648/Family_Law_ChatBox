@@ -5,7 +5,7 @@ import google.generativeai as genai
 from core.logging_setup import app_log, log_step, log_time
 from models.models import gemini_model
 from core.config import INTENT_FALLBACK_CASUAL, INTENT_RAW_PREVIEW_LIMIT
-from utils.utils import _safe_truncate, looks_like_legal
+from utils.utils import _safe_truncate, looks_like_legal, normalize_legal_query
 
 @log_time
 def _intent_via_gemini(query: str) -> Dict[str, Any]:
@@ -38,7 +38,14 @@ def _intent_via_gemini(query: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-        raw = getattr(resp, "text", "") or ""
+        raw = ""
+        try:
+            if hasattr(resp, "candidates") and resp.candidates:
+                parts = getattr(resp.candidates[0].content, "parts", [])
+                if parts and hasattr(parts[0], "text"):
+                    raw = parts[0].text
+        except Exception as e:
+            app_log.warning("Không đọc được text từ phản hồi Gemini", extra={"__kv__": {"loi": str(e)}})
         app_log.info(
             "Kết quả phân tích ý định",
             extra={
@@ -87,23 +94,27 @@ def _intent_via_gemini(query: str) -> Dict[str, Any]:
 
 @log_time
 def analyze_intent(query: str) -> Dict[str, Any]:
-    data = _intent_via_gemini(query)
+
+    normalized_input = normalize_legal_query(query)
+    cleaned_query = normalized_input["normalized_query"]
+
+    data = _intent_via_gemini(cleaned_query)
     intent = data.get("intent")
     answer = data.get("answer", "")
-    normalized_query = data.get("normalized_query", "") or query
-    original_query = data.get("original_query", "")
+    normalized_query = data.get("normalized_query", "") or cleaned_query
+    original_query = data.get("original_query") or normalized_input.get("original_query", "")
     filters = data.get("filters", {}) or {}
 
     if intent not in {"casual", "legal_answer", "law_search"}:
         if re.search(r"(?i)\bđiều\s*\d+", query) or re.search(r"(?i)\bkhoản\s*\d+", query):
             intent = "law_search"
-        elif looks_like_legal(query):
+        elif looks_like_legal(cleaned_query):
             intent = "legal_answer"
         else:
             intent = "casual"
-        log_step("intent_fallback", do_dai_query=len(query))
+        log_step("intent_fallback", do_dai_query=len(cleaned_query))
 
-    log_step("intent", loai=intent, co_legal=str(looks_like_legal(query)))
+    log_step("intent", loai=intent, goi_y=normalized_input.get("intent_hint"), co_legal=str(looks_like_legal(cleaned_query)))
     app_log.info("Quyết định ý định", extra={"__kv__": {"loai_y_dinh": intent}})
     return {
         "intent": intent,
