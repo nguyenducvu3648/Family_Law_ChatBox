@@ -50,7 +50,7 @@ def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None):
     context = "\n".join(context_lines) if context_lines else "❌ Không có điều luật nào."
 
     prompt = dedent(f"""
-    Bạn là luật sư tư vấn Luật Hôn nhân & Gia đình, chỉ dùng trích đoạn trong danh sách sau.
+    Bạn là trợ lý phân tích pháp luật về Luật Hôn nhân & Gia đình, chỉ dùng trích đoạn trong danh sách sau.
     Quy tắc:
     - Câu hỏi Đúng/Sai → trả lời **Kết luận: Đúng/Sai** + lý do.
     - Câu hỏi thường → trả lời **1–3 câu**, bám sát câu hỏi.

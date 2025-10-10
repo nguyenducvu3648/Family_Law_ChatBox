@@ -51,16 +51,45 @@ def normalize_legal_query(query: str) -> dict:
 
     # --- 3. Phân loại sơ bộ ý định ---
     intent = "general_legal"  # mặc định
-    if re.search(r"\b(phải|có|được|bị|nên)\b", text, flags=re.IGNORECASE):
+
+    # --- Ưu tiên cao nhất: So sánh / phân biệt ---
+    if re.search(r"\b(phân biệt|so sánh|khác nhau|điểm giống|điểm khác|giữa)\b", text, flags=re.IGNORECASE):
+        intent = "compare"
+
+    # --- Nhận định / Đúng sai ---
+    elif re.search(r"\b(phải|có|được|bị|nên)\b", text, flags=re.IGNORECASE):
         intent = "true_false"
-    elif  re.search(r"\b(nếu|trường hợp|giả sử|muốn hỏi|muốn biết)\b", text, flags=re.IGNORECASE):
+
+    # --- Tình huống / tư vấn / nêu ý kiến ---
+    elif re.search(
+        r"\b(nếu|trường hợp|giả sử|muốn hỏi|muốn biết|nên|có nên|làm sao|làm thế nào|cách nào|xử lý ra sao|xử lý thế nào|khởi kiện|hòa giải|phải làm gì)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
         intent = "advice"
-    elif  re.search(r"\b(là gì|được hiểu như thế nào|định nghĩa)\b", text, flags=re.IGNORECASE):
+
+    # --- Giải thích khái niệm ---
+    elif re.search(r"\b(là gì|được hiểu như thế nào|định nghĩa)\b", text, flags=re.IGNORECASE):
         intent = "definition"
-    elif  re.search(r"\b(mức phạt|xử phạt|phạt tiền|chế tài)\b", text, flags=re.IGNORECASE):
+
+    # --- Mức phạt / chế tài ---
+    elif re.search(r"\b(mức phạt|xử phạt|phạt tiền|chế tài)\b", text, flags=re.IGNORECASE):
         intent = "punishment"
-    elif  re.search(r"\b(theo luật|theo quy định|căn cứ)\b", text, flags=re.IGNORECASE):
+
+    # --- Hỏi quy định / viện dẫn luật ---
+    elif re.search(r"\b(theo luật|theo quy định|căn cứ)\b", text, flags=re.IGNORECASE):
         intent = "law_reference"
+
+    # --- Dự phòng: câu mô tả có “là / thuộc / được coi là” mà chưa có dấu hỏi ---
+    elif re.search(
+        r"\b(là|thuộc|bao gồm|gồm|được coi là|được xem là|được xác định là|có nghĩa là|được tính là|phải|được quyền|có nghĩa vụ|chịu trách nhiệm)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        intent = "true_false"
+        if not text.endswith("?"):
+            text = text.rstrip(".") + "?"
+
 
     # --- 3.5. Nếu là câu nhận định kiểu "A là B" (ví dụ: "Tài sản ... là tài sản ...") ---
     if intent == "general_legal":

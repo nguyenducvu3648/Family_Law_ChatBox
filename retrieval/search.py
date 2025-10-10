@@ -24,7 +24,7 @@ async def search_law(query: str, top_k: int = 15, score_threshold: float = 0.42)
     cached = search_cache.get(cache_key)
     if cached is not None:
         app_log.info("Tìm kiếm từ bộ nhớ cache")
-        return cached
+        return [], [], cached
 
     try:
         flt = _build_filter(query)

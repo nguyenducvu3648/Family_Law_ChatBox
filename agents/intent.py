@@ -60,12 +60,13 @@ def _intent_via_gemini(query: str) -> Dict[str, Any]:
         )
 
         if finish_reason == 2 or not raw:
-            log_step("intent_block", ly_do=str(finish_reason))
-            app_log.warning(
-                "Phân tích ý định bị chặn",
-                extra={"__kv__": {"ly_do_ket_thuc": finish_reason, "do_dai_raw": len(raw)}}
-            )
-            return {"intent": "casual", "answer": INTENT_FALLBACK_CASUAL}
+            if re.search(r"\b(điều|khoản|căn cứ|theo luật)\b", query, flags=re.IGNORECASE):
+                return {"intent": "law_search", "answer": "", "normalized_query": query}
+            elif looks_like_legal(query):
+                return {"intent": "legal_answer", "answer": "", "normalized_query": query}
+            else:
+                return {"intent": "casual", "answer": INTENT_FALLBACK_CASUAL}
+
 
         data = json.loads(raw) if raw else {}
         if not isinstance(data, dict):
@@ -105,14 +106,13 @@ def analyze_intent(query: str) -> Dict[str, Any]:
     original_query = data.get("original_query") or normalized_input.get("original_query", "")
     filters = data.get("filters", {}) or {}
 
-    if intent not in {"casual", "legal_answer", "law_search"}:
-        if re.search(r"(?i)\bđiều\s*\d+", query) or re.search(r"(?i)\bkhoản\s*\d+", query):
-            intent = "law_search"
-        elif looks_like_legal(cleaned_query):
+    if intent not in {"casual", "law_search"}:
+        if looks_like_legal(cleaned_query):
             intent = "legal_answer"
         else:
             intent = "casual"
-        log_step("intent_fallback", do_dai_query=len(cleaned_query))
+
+            log_step("intent_fallback", do_dai_query=len(cleaned_query))
 
     log_step("intent", loai=intent, goi_y=normalized_input.get("intent_hint"), co_legal=str(looks_like_legal(cleaned_query)))
     app_log.info("Quyết định ý định", extra={"__kv__": {"loai_y_dinh": intent}})
