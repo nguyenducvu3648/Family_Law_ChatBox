@@ -118,6 +118,9 @@ def build_article_header(article_no: int, article_title: str) -> str:
 # ===== Flush helpers =====
 ISSUED_DATE = "2014-06-19"
 EFFECTIVE_DATE = "2015-01-01"
+EXPIRY_DATE = "9999-12-31"
+SIGNER = "Nguyễn Sinh Hùng"
+
 def flush_article_intro(chunks, base, stats, article_no, article_title, article_intro_buf, chapter, chapter_number, section, citations):
     content = (article_intro_buf or "").strip()
     if not content:
@@ -130,6 +133,8 @@ def flush_article_intro(chunks, base, stats, article_no, article_title, article_
         "law_id": base.get("law_id"),
         "issued_date": base.get("issued_date", ISSUED_DATE),
         "effective_date": base.get("effective_date", EFFECTIVE_DATE),
+        "expiry_date": base.get("expiry_date", EXPIRY_DATE),
+        "signer": base.get("signer", SIGNER),
         "chapter": chapter,
         "chapter_number": chapter_number,
         "chapter_title": chapter,
@@ -479,7 +484,7 @@ def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: 
 def main():
     # Hardcode input/output + metadata
     class Args:
-        input = "luat_hon_nhan_va_gia_dinh.docx"   # đổi thành path file của bạn
+        input = "Chunking_Data/luat_hon_nhan_va_gia_dinh.docx"   # đổi thành path file của bạn
         output = "hn2014_chunks.json"              # file xuất JSON
         law_no = "52/2014/QH13"
         law_title = "Luật Hôn nhân và Gia đình"
