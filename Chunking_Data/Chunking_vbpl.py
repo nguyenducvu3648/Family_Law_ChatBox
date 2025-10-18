@@ -117,44 +117,30 @@ def build_article_header(article_no: int, article_title: str) -> str:
 
 
 # ===== Flush helpers =====
-<<<<<<<< HEAD:Chunking_Data/chunking.py
-ISSUED_DATE = "2014-06-19"
-EFFECTIVE_DATE = "2015-01-01"
-EXPIRY_DATE = "9999-12-31"
-SIGNER = "Nguyễn Sinh Hùng"
-
-def flush_article_intro(chunks, base, stats, article_no, article_title, article_intro_buf, chapter, chapter_number, section, citations):
-========
 def flush_article_intro(chunks, base, stats, article_no, article_title, article_intro_buf, chapter, section, citations):
->>>>>>>> main:chunking_vbpl.py
     content = (article_intro_buf or "").strip()
     if not content:
         return
     cid = f"{base['law_id']}-D{article_no}"
     exact = f"Điều {article_no}"
     meta = {
-<<<<<<<< HEAD:Chunking_Data/chunking.py
-        "law_no": base.get("law_no"),
-        "law_title": base.get("law_title"),
-        "law_id": base.get("law_id"),
-        "issued_date": base.get("issued_date", ISSUED_DATE),
-        "effective_date": base.get("effective_date", EFFECTIVE_DATE),
-        "expiry_date": base.get("expiry_date", EXPIRY_DATE),
-        "signer": base.get("signer", SIGNER),
-        "chapter": chapter,
-        "chapter_number": chapter_number,
-        "chapter_title": chapter,
-        "section": section or None,
-        "article_no": article_no,
-        "article_title": article_title or None,
-        "clause_no": None,
-        "clause_intro": None,
-        "point_id": None,
-        "point_letter": None,
-========
         **base, "chapter": chapter, "section": section,
         "article_no": article_no, "article_title": article_title,
->>>>>>>> main:chunking_vbpl.py
+        "exact_citation": exact
+    }
+    title_line = f"Điều {article_no}. {article_title}".strip() if article_title else f"Điều {article_no}"
+    chunks.append({"id": cid, "content": f"{title_line}\n{content}", "metadata": meta})
+    stats["article_intro"] += 1
+    citations.append(exact)
+def flush_article_intro(chunks, base, stats, article_no, article_title, article_intro_buf, chapter, section, citations):
+    content = (article_intro_buf or "").strip()
+    if not content:
+        return
+    cid = f"{base['law_id']}-D{article_no}"
+    exact = f"Điều {article_no}"
+    meta = {
+        **base, "chapter": chapter, "section": section,
+        "article_no": article_no, "article_title": article_title,
         "exact_citation": exact
     }
     title_line = f"Điều {article_no}. {article_title}".strip() if article_title else f"Điều {article_no}"
@@ -498,17 +484,13 @@ def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: 
 
 
 def main():
-<<<<<<<< HEAD:Chunking_Data/chunking.py
     # Hardcode input/output + metadata
     class Args:
         input = "Chunking_Data/luat_hon_nhan_va_gia_dinh.docx"   # đổi thành path file của bạn
         output = "hn2014_chunks.json"              # file xuất JSON
         law_no = "52/2014/QH13"
         law_title = "Luật Hôn nhân và Gia đình"
-        law_id = "HN2014"
-
-    args = Args()
-========
+def main():
     ap = argparse.ArgumentParser(
         description="Chunk luật (strict Chương/Điều; Khoản '1.'; Điểm 'a)'; tiêm intro khoản vào mọi điểm; và bổ sung 'Điều X {tiêu đề điều}' vào content của khoản/điểm)"
     )
@@ -518,7 +500,6 @@ def main():
     ap.add_argument("--law-title", default="Luật Hôn nhân và Gia đình")
     ap.add_argument("--law-id", default="LAW")
     args = ap.parse_args()
->>>>>>>> main:chunking_vbpl.py
 
     in_path = pathlib.Path(args.input)
     if not in_path.exists():

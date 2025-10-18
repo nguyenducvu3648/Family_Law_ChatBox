@@ -28,3 +28,4 @@ transformers>=4.34.0
 
 openpyxl
 python-docx
+pandas
