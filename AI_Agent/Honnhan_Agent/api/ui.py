@@ -207,15 +207,14 @@ def respond_generator(message, history_msgs, cur_page_size, k=15, temperature=0.
                     extra={"__kv__": {"cau_hoi": message}},
                 )
                 # Gọi async function trong sync context - dùng nest_asyncio
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
                 try:
-                    loop = asyncio.get_event_loop()
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                
-                bm25_docs, emb_docs, docs = loop.run_until_complete(
-                    search_law(message, top_k=int(k), score_threshold=float(threshold))
-                )
+                    bm25_docs, emb_docs, docs = loop.run_until_complete(
+                        search_law(message, top_k=int(k), score_threshold=float(threshold))
+                    )
+                finally:
+                    loop.close()
                 source = "law_search_embedding_fallback"
 
         elif intent == "legal_answer":
