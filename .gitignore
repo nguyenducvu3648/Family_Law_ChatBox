@@ -1,7 +1,23 @@
-.env
-venvvenv/
+# Python
 __pycache__/
-venv
-vertex-sa.json
-.gradio/
-*.log
+*.pyc
+*.pyo
+*.pyd
+.venv/
+env/
+venv/
+
+# Node.js
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# System
+.DS_Store
+Thumbs.db

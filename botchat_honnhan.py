@@ -8,24 +8,33 @@
 # from textwrap import dedent
 # from typing import List, Dict, Any, Optional, Tuple
 
-# import gradio as gr
-# from dotenv import load_dotenv
-# from qdrant_client import QdrantClient
-# from sentence_transformers import SentenceTransformer
-# import google.generativeai as genai
-# from qdrant_client.http.models import Filter, FieldCondition, MatchValue
-# from tenacity import retry, stop_after_attempt, wait_exponential
-# from rank_bm25 import BM25Okapi
-# from transformers import AutoTokenizer, AutoModelForSequenceClassification
-# import torch
-# # ================== CẤU HÌNH MÔI TRƯỜNG ==================
-# load_dotenv()
-# QDRANT_URL = os.getenv("QDRANT_URL", "").strip()
-# QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "").strip()
-# COLLECTION_NAME = os.getenv("COLLECTION_NAME", "")
-# EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
-# GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-# GEMINI_MODEL_ID = os.getenv("GEMINI_MODEL_ID", "gemini-2.5-flash")
+import gradio as gr
+from dotenv import load_dotenv
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+from sentence_transformers import SentenceTransformer
+import google.generativeai as genai
+from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+from tenacity import retry, stop_after_attempt, wait_exponential
+from rank_bm25 import BM25Okapi
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
+# ================== CẤU HÌNH MÔI TRƯỜNG ==================
+load_dotenv()
+QDRANT_URL = os.getenv("QDRANT_URL", "").strip()
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "").strip()
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL_ID = os.getenv("GEMINI_MODEL_ID", "gemini-2.5-flash")
+INTENT_DEBUG = os.getenv("INTENT_DEBUG", "0").strip() in {"1", "true", "TRUE", "yes", "on"}
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+CASUAL_MAX_WORDS = int(os.getenv("CASUAL_MAX_WORDS", "0").strip() or 0)  # 0 = không giới hạn
+INTENT_RAW_PREVIEW_LIMIT = int(os.getenv("INTENT_RAW_PREVIEW_LIMIT", "240").strip() or 240)
+INTENT_FALLBACK_CASUAL = os.getenv(
+    "INTENT_FALLBACK_CASUAL",
+    "Chào bạn, mình có thể hỗ trợ câu hỏi về Luật Hôn nhân & Gia đình. Bạn muốn hỏi nội dung gì?",
+).strip()
 
 # INTENT_DEBUG = os.getenv("INTENT_DEBUG", "0").strip() in {"1", "true", "TRUE", "yes", "on"}
 # LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -593,20 +602,21 @@
 #     title = f" — {d.get('article_title')}" if d.get("article_title") else ""
 #     return cited, chapter, title
 
-# def docs_to_markdown(docs: List[Dict[str, Any]]):
-#     if not docs:
-#         return "❌ Không tìm thấy điều luật nào."
-#     lines = []
-#     for i, d in enumerate(docs, 1):
-#         cited, chapter, title = law_line(d)
-#         content = (d.get("content") or "").strip()
-#         score = round(d.get("score", 0.0), 4)
-#         lines.append(
-#             f"**{i}. {cited}{chapter}{title}**  \n"
-#             f"{content}  \n"
-#             f"<sub>Độ liên quan: {score}</sub>\n"
-#         )
-#     return "\n".join(lines)
+def docs_to_markdown(docs: List[Dict[str, Any]]):
+    if not docs:
+        return "❌ Không tìm thấy điều luật nào."
+    lines = []
+    for i, d in enumerate(docs, 1):
+        cited, chapter, title = law_line(d)
+        content = (d.get("content") or "").strip()
+        score = round(d.get("score", 0.0), 4)
+        sid = d.get("source_id", "")
+        lines.append(
+            f"**{i}. [{sid}] {cited}{chapter}{title}**  \n" +
+            f"{content}  \n" +
+            f"<sub>Độ liên quan: {score}</sub>\n"
+        )
+    return "\n".join(lines)
 
 # def paginate_docs(docs, page: int, page_size: int):
 #     total = len(docs)
@@ -620,13 +630,14 @@
 #     total_pages = (total + page_size - 1) // page_size
 #     return sliced, total, total_pages, start
 
-# def docs_page_markdown(docs, page: int, page_size: int):
-#     sliced, total, total_pages, start = paginate_docs(docs, page, page_size)
-#     if total == 0:
-#         return "(Chưa có dữ liệu)", " Trang 0/0"
-#     body = docs_to_markdown(sliced)
-#     page_label = f" Trang {page}/{total_pages} — hiển thị {start+1}–{min(start+len(sliced), total)} / {total}"
-#     return f"**{page_label}**\n\n{body}", page_label
+
+def docs_page_markdown(docs, page: int, page_size: int):
+    sliced, total, total_pages, start = paginate_docs(docs, page, page_size)
+    if total == 0:
+        return "(Chưa có dữ liệu)", " Trang 0/0"
+    body = docs_to_markdown(sliced)
+    page_label = f" Trang {page}/{total_pages} — hiển thị {start+1}–{min(start+len(sliced), total)} / {total}"
+    return f"**{page_label}**\n\n{body}", page_label
 
 # # ================== XÂY DỰNG PROMPT ==================
 # @log_time
@@ -698,24 +709,25 @@
 #     cfg = genai.types.GenerationConfig(temperature=float(temperature))
 #     return answer_model.generate_content(prompt, generation_config=cfg, stream=True)
 
-# @log_time
-# def stream_answer(prompt, temperature=0.2):
-#     t0 = time.perf_counter()
-#     t_first0 = time.perf_counter()
-#     first_token_emitted = False
-#     try:
-#         resp = _gemini_stream(prompt, temperature)
-#         for ch in resp:
-#             if getattr(ch, "text", None):
-#                 if not first_token_emitted:
-#                     log_step("llm_first_token", thoi_gian_truoc=f"{time.perf_counter()-t_first0:.4f}")
-#                     first_token_emitted = True
-#                 yield ch.text
-#     except Exception as e:
-#         app_log.error("Lỗi gọi mô hình LLM", extra={"__kv__": {"loi": str(e)}})
-#         yield f"\n\nLỗi gọi mô hình: {e}"
-#     finally:
-#         log_step("llm_tong", thoi_gian=f"{time.perf_counter()-t0:.4f}")
+@log_time
+def stream_answer(prompt, temperature=0.2):
+    t0 = time.perf_counter()
+    t_first0 = time.perf_counter()
+    first_token_emitted = False
+    try:
+        resp = _gemini_stream(prompt, temperature)
+        resp = _gemini_stream(prompt, temperature)
+        for ch in resp:
+            if getattr(ch, "text", None):
+                if not first_token_emitted:
+                    log_step("llm_first_token", thoi_gian_truoc=f"{time.perf_counter()-t_first0:.4f}")
+                    first_token_emitted = True
+                yield ch.text
+    except Exception as e:
+        app_log.error("Lỗi gọi mô hình LLM", extra={"__kv__": {"loi": str(e)}})
+        yield f"\n\nLỗi gọi mô hình: {e}"
+    finally:
+        log_step("llm_tong", thoi_gian=f"{time.perf_counter()-t0:.4f}")
 
 # # ================== LẤY DỮ LIỆU QDRANT ==================
 # @log_time
@@ -1225,18 +1237,18 @@
 #     send.click(respond_wrapper, inputs=[msg, state_history, page_size], outputs=outputs, queue=True)
 #     msg.submit(respond_wrapper, inputs=[msg, state_history, page_size], outputs=outputs, queue=True)
 
-#     # Like/Dislike
-#     def on_like(data: gr.LikeData):
-#         msg_like = data.value or {}
-#         role = msg_like.get("role", "assistant")
-#         text = msg_like.get("content", "")
-#         app_log.info(
-#             "Phản hồi người dùng",
-#             extra={"__kv__": {"thich": data.liked, "vai_tro": role, "do_dai": len(text or "")}},
-#         )
-#         return None
-
-#     chatbot.like(on_like)
+    # Like/Dislike
+    # Like/Dislike
+    def on_like(data: gr.LikeData):
+        msg_like = data.value or {}
+        role = msg_like.get("role", "assistant")
+        text = msg_like.get("content", "")
+        app_log.info(
+            "Phản hồi người dùng",
+            extra={"__kv__": {"thich": data.liked, "vai_tro": role, "do_dai": len(text or "")}},
+        )
+        return None
+    chatbot.like(on_like)
 
 #     # Phân trang
 #     def render_cites_for_page(docs, page, cur_page_size):
@@ -1259,28 +1271,15 @@
 #     def on_change_page_size(docs, cur_page_size):
 #         return render_cites_for_page(docs, 1, cur_page_size)
 
-#     prev_page.click(
-#         go_prev,
-#         inputs=[state_docs, state_page, page_size],
-#         outputs=[cites_md, state_page, page_info],
-#         queue=False,
-#     )
-#     next_page.click(
-#         go_next,
-#         inputs=[state_docs, state_page, page_size],
-#         outputs=[cites_md, state_page, page_info],
-#         queue=False,
-#     )
-#     page_size.release(
-#         on_change_page_size,
-#         inputs=[state_docs, page_size],
-#         outputs=[cites_md, state_page, page_info],
-#         queue=False,
-#     )
+    prev_page.click(go_prev, inputs=[state_docs, state_page, page_size], outputs=[cites_md, state_page, page_info], queue=False)
+    next_page.click(go_next, inputs=[state_docs, state_page, page_size], outputs=[cites_md, state_page, page_info], queue=False)
+    page_size.release(on_change_page_size, inputs=[state_docs, page_size], outputs=[cites_md, state_page, page_info], queue=False)
 
-#     gr.Markdown(f"""
-#     <sub>© {datetime.now().year} — Nội dung chỉ mang tính tham khảo, không thay thế tư vấn pháp lý chính thức.</sub>
-#     """)
+    gr.Markdown(f"""
+    <sub>© {datetime.now().year} — Nội dung chỉ mang tính tham khảo, không thay thế tư vấn pháp lý chính thức.</sub>
+    gr.Markdown(f"""
+    <sub>© {datetime.now().year} — Nội dung chỉ mang tính tham khảo, không thay thế tư vấn pháp lý chính thức.</sub>
+    """)
 
 # if __name__ == "__main__":
 #     demo.queue()
