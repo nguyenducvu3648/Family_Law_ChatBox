@@ -2,6 +2,7 @@ import os
 import glob
 import json
 import re
+import statistics
 import pandas as pd
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
@@ -22,8 +23,8 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
 # Các hằng số cho bài test
 DATA_FOLDER = "data"
 TEST_DATA_FILE = "HNGD_Test.xlsx"
-OUTPUT_FILE = "results/results_BAAI_retrieval.json"
-TOP_K_VALUES = [5, 10, 15, 20]
+OUTPUT_FILE = "results/results_BAAI_retrieval_only.json"
+TOP_K_VALUES = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85 ,90, 95, 100, 105, 110, 115, 120, 125, 130, 135, 140, 145, 150 ]
 MAX_K = max(TOP_K_VALUES)
 
 # --- Các Hàm Tiện Ích ---
@@ -148,7 +149,7 @@ def run_test(
     ground_truth_refs: Set[Tuple[str, str, str]], 
     model: SentenceTransformer, 
     client: QdrantClient
-) -> Tuple[Dict[str, bool], bool, List[Dict[str, Any]]]:
+) -> Tuple[Dict[str, bool], bool, List[Dict[str, Any]], Any]:
     """
     Thực hiện embedding, retrieval và so sánh cho một query.
     Trả về:
@@ -161,7 +162,7 @@ def run_test(
     query_vector = model.encode(query, convert_to_tensor=False).tolist()
     
     # 2. Retrieval
-    search_results = client.search(
+    search_results = client.query_points(
         collection_name=COLLECTION_NAME,
         query_vector=query_vector,
         limit=MAX_K,
@@ -182,13 +183,21 @@ def run_test(
         if pt is not None:
             pt = re.sub(r"[^a-zA-ZđĐ]", "", str(pt)).lower() or None
 
+        # try to extract score if present on hit object
+        score = None
+        try:
+            score = getattr(hit, 'score', None)
+        except Exception:
+            score = None
+
         return {
             "id": meta.get('id') or payload.get('id'),
             "article_no": str(art) if art is not None else None,
             "clause_no": str(cla) if cla is not None else None,
             "point_letter": pt,
             "article_title": meta.get('article_title'),
-            "exact_citation": meta.get('exact_citation')
+            "exact_citation": meta.get('exact_citation'),
+            "score": score
         }
 
     retrieved_payloads = [compact_hit(hit) for hit in search_results[:MAX_K]]
@@ -196,6 +205,7 @@ def run_test(
     # 4. So sánh
     hits_at_k = {}
     found_in_max_k = False
+    first_hit_rank = None
     
     def ground_truth_matches(retrieved_ref: Tuple[str,str,str], gt_ref: Tuple[str,str,str]) -> bool:
         """Return True if retrieved_ref matches gt_ref where gt None acts as wildcard."""
@@ -221,12 +231,43 @@ def run_test(
                 return False
         return True
 
+    # Precompute normalized refs for top MAX_K results
+    top_max_results = search_results[:MAX_K]
+    retrieved_refs_all = [normalize_payload_ref(hit.payload) for hit in top_max_results]
+
+    # collect scores for top_max_results
+    retrieved_scores_all = []
+    for hit in top_max_results:
+        sc = None
+        try:
+            sc = getattr(hit, 'score', None)
+        except Exception:
+            sc = None
+        # fallback: if payload contains 'score'
+        if sc is None and isinstance(hit, dict):
+            sc = hit.get('payload', {}).get('score') if isinstance(hit.get('payload', {}), dict) else None
+        retrieved_scores_all.append(sc)
+
+    # determine first hit rank (1-based) and its score if any
+    first_hit_score = None
+    for idx, rr in enumerate(retrieved_refs_all, start=1):
+        for gt in ground_truth_refs:
+            if ground_truth_matches(rr, gt):
+                first_hit_rank = idx
+                try:
+                    first_hit_score = retrieved_scores_all[idx-1]
+                except Exception:
+                    first_hit_score = None
+                break
+        if first_hit_rank is not None:
+            break
+
     for k in TOP_K_VALUES:
         # Lấy K kết quả đầu tiên
-        top_k_results = search_results[:k]
-        
+        top_k_results = top_max_results[:k]
+
         # Chuyển đổi payload của K kết quả đó thành set các tham chiếu
-        retrieved_refs_at_k = [normalize_payload_ref(hit.payload) for hit in top_k_results]
+        retrieved_refs_at_k = retrieved_refs_all[:k]
         
         # Debug: In cho query đầu tiên (sử dụng biến global hoặc flag)
         try:
@@ -256,7 +297,7 @@ def run_test(
         if is_hit:
             found_in_max_k = True # Đánh dấu đã tìm thấy
             
-    return hits_at_k, found_in_max_k, retrieved_payloads
+    return hits_at_k, found_in_max_k, retrieved_payloads, first_hit_rank, first_hit_score
 
 # --- Hàm Chính ---
 
@@ -280,6 +321,9 @@ def main():
     summary.update({f"hit_at_{k}": 0 for k in TOP_K_VALUES})
     
     missed_queries_details = []
+    first_hit_ranks: List[int] = []
+    queries_with_any_first_hit = 0
+    first_hit_scores: List[float] = []
 
     print(f"\n--- BẮT ĐẦU QUÁ TRÌNH TEST ({total_queries} QUERIES) ---")
 
@@ -297,7 +341,7 @@ def main():
                 continue
 
             # 2. Chạy test
-            hits_at_k, found_in_max_k, retrieved_payloads = run_test(
+            hits_at_k, found_in_max_k, retrieved_payloads, first_hit_rank, first_hit_score = run_test(
                 query, ground_truth_refs, model, client
             )
             
@@ -316,6 +360,15 @@ def main():
                     "expected_references": [str(ref) for ref in ground_truth_refs],
                     f"retrieved_top_{MAX_K}": retrieved_payloads
                 })
+            # record first hit rank stats
+            if first_hit_rank is not None:
+                first_hit_ranks.append(first_hit_rank)
+                queries_with_any_first_hit += 1
+            if first_hit_score is not None:
+                try:
+                    first_hit_scores.append(float(first_hit_score))
+                except Exception:
+                    pass
 
             # In tiến độ
             if (summary["scanned_queries"] % 10) == 0:
@@ -335,6 +388,37 @@ def main():
         hit_count = summary[f"hit_at_{k}"]
         recall = (hit_count / summary["scanned_queries"]) * 100 if summary["scanned_queries"] > 0 else 0
         summary[f"recall_at_{k}_percent"] = round(recall, 2)
+
+    # Tính thống kê first-hit
+    if first_hit_ranks:
+        avg_first_hit = sum(first_hit_ranks) / len(first_hit_ranks)
+    else:
+        avg_first_hit = None
+
+    summary["avg_first_hit_rank"] = round(avg_first_hit, 2) if avg_first_hit is not None else None
+    summary["pct_queries_with_first_hit_within_top_{0}".format(MAX_K)] = round((queries_with_any_first_hit / summary["scanned_queries"])*100, 2) if summary["scanned_queries"]>0 else 0.0
+    # Score stats
+    if first_hit_scores:
+        avg_first_hit_score = statistics.mean(first_hit_scores)
+        std_first_hit_score = statistics.pstdev(first_hit_scores)
+        max_first_hit_score = max(first_hit_scores)
+        min_first_hit_score = min(first_hit_scores)
+    else:
+        avg_first_hit_score = None
+        std_first_hit_score = None
+        max_first_hit_score = None
+        min_first_hit_score = None
+
+    summary["avg_first_hit_score"] = round(avg_first_hit_score, 4) if avg_first_hit_score is not None else None
+    summary["std_first_hit_score"] = round(std_first_hit_score, 4) if std_first_hit_score is not None else None
+    summary["max_first_hit_score"] = round(max_first_hit_score, 4) if max_first_hit_score is not None else None
+    summary["min_first_hit_score"] = round(min_first_hit_score, 4) if min_first_hit_score is not None else None
+    # simple suggested threshold: mean - stddev (users can choose more conservative value)
+    if avg_first_hit_score is not None and std_first_hit_score is not None:
+        suggested = avg_first_hit_score - std_first_hit_score
+        summary["suggested_score_threshold_mean_minus_std"] = round(suggested, 4)
+    else:
+        summary["suggested_score_threshold_mean_minus_std"] = None
 
     # 5. Tạo báo cáo cuối cùng
     report = {
