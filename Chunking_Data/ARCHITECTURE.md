@@ -149,6 +149,7 @@ Package được thiết kế theo các nguyên tắc:
 ## 🔧 Scripts Layer (User Interface)
 
 Scripts là thin wrappers around pipelines, cung cấp CLI interface.
+gitt
 
 ### find_files.py
 
