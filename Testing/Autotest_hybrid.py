@@ -4,7 +4,7 @@ import json
 import re
 import statistics
 import pandas as pd
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, models # <-- Đã thêm models
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 from typing import Set, Tuple, Any, Dict, List
@@ -23,7 +23,13 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
 # Các hằng số cho bài test
 DATA_FOLDER = "data"
 TEST_DATA_FILE = "HNGD_Test.xlsx"
-OUTPUT_FILE = "results/results_BAAI_HNGD_retrieval_only_V1.json"
+
+# --- CẤU HÌNH CHẾ ĐỘ TEST ---
+# CHỌN CHẾ ĐỘ TEST: "dense" (chỉ vector) hoặc "hybrid" (vector + full-text RRF)
+TEST_MODE = "hybrid" 
+# -------------------------
+
+OUTPUT_FILE = f"results/results_BAAI_HNGD_{TEST_MODE}_V4.json" # <-- Tên file tự động
 TOP_K_VALUES = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85 ,90, 95, 100, 105, 110, 115, 120, 125, 130, 135, 140, 145, 150 ]
 MAX_K = max(TOP_K_VALUES)
 
@@ -148,26 +154,52 @@ def run_test(
     query: str, 
     ground_truth_refs: Set[Tuple[str, str, str]], 
     model: SentenceTransformer, 
-    client: QdrantClient
-) -> Tuple[Dict[str, bool], bool, List[Dict[str, Any]], Any]:
+    client: QdrantClient,
+    search_mode: str = "dense"  # <-- THAM SỐ MỚI
+) -> Tuple[Dict[str, bool], bool, List[Dict[str, Any]], Any, Any]:
     """
     Thực hiện embedding, retrieval và so sánh cho một query.
     Trả về:
     1. Dict kết quả hit/miss cho từng mốc K.
     2. Bool tổng quát: có tìm thấy ở K cao nhất không.
     3. List các payload đã retrieve (để báo cáo lỗi).
+    4. Rank của hit đầu tiên (None nếu không có).
+    5. Score của hit đầu tiên (None nếu không có).
     """
     
     # 1. Embedding
     query_vector = model.encode(query, convert_to_tensor=False).tolist()
     
-    # 2. Retrieval
-    search_results = client.query_points(
-        collection_name=COLLECTION_NAME,
-        query=query_vector,
-        limit=MAX_K,
-        with_payload=True
-    )
+    # 2. Retrieval (ĐÃ CẬP NHẬT VỚI LOGIC HYBRID)
+    if search_mode == "hybrid":
+        # --- LOGIC HYBRID SEARCH (RRF) ---
+        # Yêu cầu: Collection phải có payload index trên trường text (ví dụ: 'text_chunk')
+        search_results = client.query_points(
+            collection_name=COLLECTION_NAME,
+            # Yêu cầu Qdrant thực hiện 2 truy vấn này trước
+            prefetch=[
+                models.Prefetch(
+                    query=query_vector, # 1. Truy vấn Dense Vector
+                    limit=MAX_K
+                ),
+                models.Prefetch(
+                    query=query, # 2. Truy vấn Full-text (BM25/sparse)
+                    limit=MAX_K
+                )
+            ],
+            # Sau đó, "trộn" (fuse) kết quả bằng RRF
+            query=models.Fusion.RRF, # <-- SỬA LỖI Ở ĐÂY
+            limit=MAX_K,
+            with_payload=True
+        )
+    else:
+        # --- LOGIC DENSE SEARCH (CŨ CỦA BẠN) ---
+        search_results = client.query_points(
+            collection_name=COLLECTION_NAME,
+            query=query_vector,
+            limit=MAX_K,
+            with_payload=True
+        )
     
     # 3. Chuẩn hóa kết quả retrieve
     # We'll keep a compact view of top MAX_K retrieved items (metadata only) to include in miss reports
@@ -315,6 +347,9 @@ def main():
     
     # Khởi tạo cấu trúc báo cáo
     summary = {
+        "test_mode": TEST_MODE, # <-- Thêm thông tin chế độ test
+        "collection_name": COLLECTION_NAME,
+        "embedding_model": EMBEDDING_MODEL,
         "total_queries_in_file": total_queries,
         "scanned_queries": 0,
         "queries_with_no_hit": 0,
@@ -327,6 +362,7 @@ def main():
     first_hit_scores: List[float] = []
 
     print(f"\n--- BẮT ĐẦU QUÁ TRÌNH TEST ({total_queries} QUERIES) ---")
+    print(f"--- CHẾ ĐỘ TEST: {TEST_MODE.upper()} ---")
 
     # Lặp qua từng hàng trong DataFrame
     for index, row in df.iterrows():
@@ -341,9 +377,13 @@ def main():
                 print(f"Cảnh báo: Không thể trích xuất tham chiếu từ 'Positive' cho query: '{query}'. Bỏ qua.")
                 continue
 
-            # 2. Chạy test
+            # 2. Chạy test (ĐÃ CẬP NHẬT)
             hits_at_k, found_in_max_k, retrieved_payloads, first_hit_rank, first_hit_score = run_test(
-                query, ground_truth_refs, model, client
+                query, 
+                ground_truth_refs, 
+                model, 
+                client,
+                search_mode=TEST_MODE  # <-- Truyền chế độ test vào
             )
             
             # 3. Cập nhật thống kê
@@ -393,11 +433,17 @@ def main():
     # Tính thống kê first-hit
     if first_hit_ranks:
         avg_first_hit = sum(first_hit_ranks) / len(first_hit_ranks)
+        # Tính MRR (Mean Reciprocal Rank)
+        reciprocal_ranks = [1 / r for r in first_hit_ranks]
+        mrr = statistics.mean(reciprocal_ranks)
     else:
         avg_first_hit = None
+        mrr = None
 
     summary["avg_first_hit_rank"] = round(avg_first_hit, 2) if avg_first_hit is not None else None
+    summary["mrr"] = round(mrr, 4) if mrr is not None else None # <-- Thêm MRR
     summary["pct_queries_with_first_hit_within_top_{0}".format(MAX_K)] = round((queries_with_any_first_hit / summary["scanned_queries"])*100, 2) if summary["scanned_queries"]>0 else 0.0
+    
     # Score stats
     if first_hit_scores:
         avg_first_hit_score = statistics.mean(first_hit_scores)
@@ -414,6 +460,7 @@ def main():
     summary["std_first_hit_score"] = round(std_first_hit_score, 4) if std_first_hit_score is not None else None
     summary["max_first_hit_score"] = round(max_first_hit_score, 4) if max_first_hit_score is not None else None
     summary["min_first_hit_score"] = round(min_first_hit_score, 4) if min_first_hit_score is not None else None
+    
     # simple suggested threshold: mean - stddev (users can choose more conservative value)
     if avg_first_hit_score is not None and std_first_hit_score is not None:
         suggested = avg_first_hit_score - std_first_hit_score
@@ -429,6 +476,9 @@ def main():
     
     # 6. Lưu file JSON
     try:
+        # Đảm bảo thư mục 'results' tồn tại
+        os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
+        
         with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
             json.dump(report, f, ensure_ascii=False, indent=4)
         print(f"\nBáo cáo đã được lưu thành công tại: {OUTPUT_FILE}")

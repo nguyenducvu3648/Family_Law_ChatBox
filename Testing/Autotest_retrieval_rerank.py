@@ -9,6 +9,10 @@ from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 from typing import Set, Tuple, Any, Dict, List
 
+### THAY ĐỔI ###
+# Thêm CrossEncoder để rerank
+from sentence_transformers import CrossEncoder
+
 # --- Cấu hình và Hằng số ---
 
 # Tải biến môi trường từ file .env (nếu có)
@@ -20,19 +24,32 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "luat_hon_nhan_va_gia_dinh_2014")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
 
+### THAY ĐỔI ###
+# Thêm mô hình Reranker
+RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-base")
+# QUAN TRỌNG: Đặt tên trường payload chứa text của chunk
+# Đây là trường mà reranker sẽ đọc. Ví dụ: 'text_chunk', 'content', 'text', 'van_ban'
+TEXT_PAYLOAD_FIELD = "text_chunk" 
+
 # Các hằng số cho bài test
 DATA_FOLDER = "data"
 TEST_DATA_FILE = "HNGD_Test.xlsx"
-OUTPUT_FILE = "results/results_BAAI_HNGD_retrieval_only_V1.json"
+### THAY ĐỔI ###
+# Đổi tên file output để phân biệt
+OUTPUT_FILE = "results/results_BAAI_HNGD_retrieval_RERANKED_V1.json"
 TOP_K_VALUES = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85 ,90, 95, 100, 105, 110, 115, 120, 125, 130, 135, 140, 145, 150 ]
-MAX_K = max(TOP_K_VALUES)
+MAX_K = max(TOP_K_VALUES) # Đây là số lượng retrieve ban đầu (K-retrieval)
 
 # --- Các Hàm Tiện Ích ---
 
-def initialize_clients() -> Tuple[SentenceTransformer, QdrantClient]:
-    """Khởi tạo mô hình embedding và Qdrant client."""
+### THAY ĐỔI ###
+def initialize_clients() -> Tuple[SentenceTransformer, QdrantClient, CrossEncoder]:
+    """Khởi tạo mô hình embedding, Qdrant client và Reranker."""
     print(f"Đang tải mô hình embedding: {EMBEDDING_MODEL}...")
     model = SentenceTransformer(EMBEDDING_MODEL)
+    
+    print(f"Đang tải mô hình reranker: {RERANKER_MODEL}...")
+    reranker = CrossEncoder(RERANKER_MODEL)
     
     print(f"Đang kết nối tới Qdrant tại: {QDRANT_URL}...")
     client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=120)
@@ -46,7 +63,7 @@ def initialize_clients() -> Tuple[SentenceTransformer, QdrantClient]:
         print(f"Chi tiết lỗi: {e}")
         raise
         
-    return model, client
+    return model, client, reranker
 
 def load_excel_data(folder_path: str, specific_filename: str) -> pd.DataFrame:
     """Tải và xác thực file Excel được chỉ định từ thư mục."""
@@ -144,51 +161,129 @@ def normalize_payload_ref(payload: Dict[str, Any]) -> Tuple[str, str, str]:
 
     return (d_str, k_str, p_str)
 
+### THAY ĐỔI ###
 def run_test(
     query: str, 
     ground_truth_refs: Set[Tuple[str, str, str]], 
     model: SentenceTransformer, 
-    client: QdrantClient
+    client: QdrantClient,
+    reranker: CrossEncoder  # Thêm reranker
 ) -> Tuple[Dict[str, bool], bool, List[Dict[str, Any]], Any]:
     """
-    Thực hiện embedding, retrieval và so sánh cho một query.
+    Thực hiện embedding, retrieval, RERANKING và so sánh cho một query.
     Trả về:
     1. Dict kết quả hit/miss cho từng mốc K.
     2. Bool tổng quát: có tìm thấy ở K cao nhất không.
-    3. List các payload đã retrieve (để báo cáo lỗi).
+    3. List các payload đã retrieve (ĐÃ RERANK, để báo cáo lỗi).
     """
     
     # 1. Embedding
     query_vector = model.encode(query, convert_to_tensor=False).tolist()
     
-    # 2. Retrieval
+    # 2. Retrieval (Lấy K lớn nhất, ví dụ 150)
     search_results = client.query_points(
         collection_name=COLLECTION_NAME,
         query=query_vector,
         limit=MAX_K,
-        with_payload=True
+        with_payload=True,
+        with_vectors=False # Không cần trả về vector
     )
     
-    # 3. Chuẩn hóa kết quả retrieve
-    # We'll keep a compact view of top MAX_K retrieved items (metadata only) to include in miss reports
+    top_max_results = search_results.points # Đây là list các ScoredPoint
+    
+    # --- BƯỚC 2.5: RERANKING ---
+    # print(f"DEBUG: Bắt đầu rerank {len(top_max_results)} kết quả...")
+    
+    # 2.5.1. Chuẩn bị các cặp [query, text]
+    # QUAN TRỌNG: Đảm bảo payload của bạn chứa trường văn bản thực tế.
+    # Thay 'text_chunk' bằng tên trường chính xác trong Qdrant payload của bạn (ví dụ: 'content', 'text', 'van_ban', v.v.)
+    rerank_pairs = []
+    hits_without_text = [] # Để theo dõi các hit không có text
+    
+    for i, hit in enumerate(top_max_results):
+        doc_text = None
+        if isinstance(hit.payload, dict):
+            # Cố gắng lấy text từ payload gốc
+            doc_text = hit.payload.get(TEXT_PAYLOAD_FIELD)
+            
+            # Fallback nếu text nằm trong 'metadata'
+            if not doc_text and isinstance(hit.payload.get('metadata'), dict):
+                 doc_text = hit.payload.get('metadata', {}).get(TEXT_PAYLOAD_FIELD)
+
+        if doc_text and isinstance(doc_text, str):
+            rerank_pairs.append([query, doc_text])
+        else:
+            # Nếu không tìm thấy text, đánh dấu để xử lý
+            # print(f"CẢNH BÁO: Không tìm thấy trường text '{TEXT_PAYLOAD_FIELD}' trong payload cho ID: {hit.id}. Sẽ gán score rerank = -inf.")
+            hits_without_text.append(i) # Lưu lại chỉ số (index)
+            rerank_pairs.append(None) # Thêm placeholder
+
+    # 2.5.2. Tính điểm rerank
+    rerank_scores = []
+    valid_pairs = [pair for pair in rerank_pairs if pair is not None]
+    
+    if valid_pairs:
+        # Chỉ đưa các cặp hợp lệ vào model
+        scores_from_model = reranker.predict(valid_pairs, convert_to_tensor=False).tolist()
+        
+        # Map điểm về lại list ban đầu
+        score_idx = 0
+        for pair in rerank_pairs:
+            if pair is not None:
+                rerank_scores.append(scores_from_model[score_idx])
+                score_idx += 1
+            else:
+                rerank_scores.append(float('-inf')) # Đẩy các kết quả không có text xuống cuối
+    else:
+        # Trường hợp không có valid pairs nào
+        rerank_scores = [float('-inf')] * len(rerank_pairs)
+
+    # 2.5.3. Kết hợp kết quả và sắp xếp lại
+    # Gói (hit_object, original_retrieval_score, new_rerank_score)
+    combined_results = []
+    for hit, rerank_score in zip(top_max_results, rerank_scores):
+        combined_results.append({
+            "hit_object": hit, # ScoredPoint object (chứa payload, id, score cũ)
+            "retrieval_score": hit.score, 
+            "rerank_score": rerank_score
+        })
+
+    # Sắp xếp lại dựa trên rerank_score (cao nhất -> thấp nhất)
+    combined_results.sort(key=lambda x: x["rerank_score"], reverse=True)
+    
+    # List kết quả cuối cùng (chỉ chứa các ScoredPoint) đã được sắp xếp lại
+    reranked_results = [item["hit_object"] for item in combined_results]
+    
+    # print("DEBUG: Rerank hoàn tất.")
+    # --- KẾT THÚC RERANKING ---
+
+
+    # 3. Chuẩn hóa kết quả retrieve (ĐÃ RERANK)
     def compact_hit(hit) -> Dict[str, Any]:
-        # hit is expected to have .payload (dict)
         payload = hit.payload if hasattr(hit, 'payload') else (hit if isinstance(hit, dict) else {})
         meta = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else payload
 
-        # Normalize values
         art = meta.get('article_no')
         cla = meta.get('clause_no')
         pt = meta.get('point_letter') or meta.get('point_id') or None
         if pt is not None:
             pt = re.sub(r"[^a-zA-ZđĐ]", "", str(pt)).lower() or None
 
-        # try to extract score if present on hit object
-        score = None
+        # Lấy retrieval score (từ Qdrant)
+        retrieval_score = None
         try:
-            score = getattr(hit, 'score', None)
+            retrieval_score = getattr(hit, 'score', None)
         except Exception:
-            score = None
+            retrieval_score = None
+            
+        # Lấy rerank score (từ combined_results, cần tìm lại)
+        # Cách đơn giản: Tìm trong combined_results
+        # Lưu ý: 'hit' ở đây là 'hit_object'
+        rerank_score_found = None
+        for item in combined_results:
+            if item["hit_object"].id == hit.id:
+                 rerank_score_found = item["rerank_score"]
+                 break
 
         return {
             "id": meta.get('id') or payload.get('id'),
@@ -197,11 +292,12 @@ def run_test(
             "point_letter": pt,
             "article_title": meta.get('article_title'),
             "exact_citation": meta.get('exact_citation'),
-            "score": score
+            "retrieval_score": retrieval_score,
+            "rerank_score": rerank_score_found # Thêm điểm rerank vào log
         }
 
-    top_max_results = search_results.points
-    retrieved_payloads = [compact_hit(hit) for hit in top_max_results]
+    # Lấy payload đã được SẮP XẾP LẠI (reranked)
+    retrieved_payloads = [compact_hit(hit) for hit in reranked_results]
     
     # 4. So sánh
     hits_at_k = {}
@@ -232,22 +328,11 @@ def run_test(
                 return False
         return True
 
-    # Precompute normalized refs for top MAX_K results
-    # top_max_results = search_results[:MAX_K]
-    retrieved_refs_all = [normalize_payload_ref(hit.payload) for hit in top_max_results]
+    # Precompute normalized refs cho KẾT QUẢ ĐÃ RERANK
+    retrieved_refs_all = [normalize_payload_ref(hit.payload) for hit in reranked_results]
 
-    # collect scores for top_max_results
-    retrieved_scores_all = []
-    for hit in top_max_results:
-        sc = None
-        try:
-            sc = getattr(hit, 'score', None)
-        except Exception:
-            sc = None
-        # fallback: if payload contains 'score'
-        if sc is None and isinstance(hit, dict):
-            sc = hit.get('payload', {}).get('score') if isinstance(hit.get('payload', {}), dict) else None
-        retrieved_scores_all.append(sc)
+    # Lấy RERANK scores cho top_max_results
+    retrieved_scores_all = [item["rerank_score"] for item in combined_results]
 
     # determine first hit rank (1-based) and its score if any
     first_hit_score = None
@@ -264,27 +349,26 @@ def run_test(
             break
 
     for k in TOP_K_VALUES:
-        # Lấy K kết quả đầu tiên
-        top_k_results = top_max_results[:k]
+        # Lấy K kết quả đầu tiên TỪ DANH SÁCH ĐÃ RERANK
+        # top_k_results = reranked_results[:k] # Không cần thiết, đã có retrieved_refs_all
 
         # Chuyển đổi payload của K kết quả đó thành set các tham chiếu
         retrieved_refs_at_k = retrieved_refs_all[:k]
         
-        # Debug: In cho query đầu tiên (sử dụng biến global hoặc flag)
+        # Debug: In cho query đầu tiên
         try:
             if run_test.debug_count < 1:
                 print(f"DEBUG Query: {query}")
                 print(f"DEBUG Ground truth: {ground_truth_refs}")
-                print(f"DEBUG Retrieved at {k}: {retrieved_refs_at_k}")
+                print(f"DEBUG RERANKED Retrieved at {k}: {retrieved_refs_at_k}")
                 run_test.debug_count += 1
         except AttributeError:
             run_test.debug_count = 1
             print(f"DEBUG Query: {query}")
             print(f"DEBUG Ground truth: {ground_truth_refs}")
-            print(f"DEBUG Retrieved at {k}: {retrieved_refs_at_k}")
+            print(f"DEBUG RERANKED Retrieved at {k}: {retrieved_refs_at_k}")
         
-        # Kiểm tra xem có bất kỳ tham chiếu "ground truth" nào
-        # khớp (với None trong ground truth là wildcard) với các tham chiếu retrieve được
+        # Kiểm tra
         is_hit = False
         for gt in ground_truth_refs:
             for rr in retrieved_refs_at_k:
@@ -298,6 +382,7 @@ def run_test(
         if is_hit:
             found_in_max_k = True # Đánh dấu đã tìm thấy
             
+    # Trả về điểm first_hit_score (đã là rerank score)
     return hits_at_k, found_in_max_k, retrieved_payloads, first_hit_rank, first_hit_score
 
 # --- Hàm Chính ---
@@ -305,7 +390,8 @@ def run_test(
 def main():
     """Hàm thực thi chính của quy trình test."""
     try:
-        model, client = initialize_clients()
+        ### THAY ĐỔI ###
+        model, client, reranker = initialize_clients()
         df = load_excel_data(DATA_FOLDER, TEST_DATA_FILE)
     except Exception as e:
         print(f"LỖI NGHIÊM TRỌNG khi khởi tạo hoặc tải dữ liệu: {e}")
@@ -315,6 +401,13 @@ def main():
     
     # Khởi tạo cấu trúc báo cáo
     summary = {
+        "test_run_parameters": {
+            "embedding_model": EMBEDDING_MODEL,
+            "reranker_model": RERANKER_MODEL,
+            "collection_name": COLLECTION_NAME,
+            "retrieval_k_before_rerank": MAX_K,
+            "text_payload_field_used": TEXT_PAYLOAD_FIELD
+        },
         "total_queries_in_file": total_queries,
         "scanned_queries": 0,
         "queries_with_no_hit": 0,
@@ -326,7 +419,7 @@ def main():
     queries_with_any_first_hit = 0
     first_hit_scores: List[float] = []
 
-    print(f"\n--- BẮT ĐẦU QUÁ TRÌNH TEST ({total_queries} QUERIES) ---")
+    print(f"\n--- BẮT ĐẦU QUÁ TRÌNH TEST (với Reranker: {RERANKER_MODEL}) ---")
 
     # Lặp qua từng hàng trong DataFrame
     for index, row in df.iterrows():
@@ -341,9 +434,10 @@ def main():
                 print(f"Cảnh báo: Không thể trích xuất tham chiếu từ 'Positive' cho query: '{query}'. Bỏ qua.")
                 continue
 
-            # 2. Chạy test
+            # 2. Chạy test (với reranker)
+            ### THAY ĐỔI ###
             hits_at_k, found_in_max_k, retrieved_payloads, first_hit_rank, first_hit_score = run_test(
-                query, ground_truth_refs, model, client
+                query, ground_truth_refs, model, client, reranker
             )
             
             # 3. Cập nhật thống kê
@@ -352,20 +446,20 @@ def main():
                 if is_hit:
                     summary[k_str] += 1
                     
-            # 4. Ghi lại các trường hợp "miss"
+            # 4. Ghi lại các trường hợp "miss" (sau khi đã rerank)
             if not found_in_max_k:
                 summary["queries_with_no_hit"] += 1
-                # Only include compact retrieved metadata for misses to keep the report focused and smaller
                 missed_queries_details.append({
                     "query": query,
                     "expected_references": [str(ref) for ref in ground_truth_refs],
-                    f"retrieved_top_{MAX_K}": retrieved_payloads
+                    f"retrieved_and_reranked_top_{MAX_K}": retrieved_payloads
                 })
+            
             # record first hit rank stats
             if first_hit_rank is not None:
                 first_hit_ranks.append(first_hit_rank)
                 queries_with_any_first_hit += 1
-            if first_hit_score is not None:
+            if first_hit_score is not None and first_hit_score != float('-inf'): # Bỏ qua các score -inf
                 try:
                     first_hit_scores.append(float(first_hit_score))
                 except Exception:
@@ -377,6 +471,8 @@ def main():
 
         except Exception as e:
             print(f"Lỗi khi xử lý query: '{query}'. Lỗi: {e}")
+            import traceback
+            traceback.print_exc() # In chi tiết lỗi
             missed_queries_details.append({
                 "query": query,
                 "error": str(e)
@@ -398,7 +494,8 @@ def main():
 
     summary["avg_first_hit_rank"] = round(avg_first_hit, 2) if avg_first_hit is not None else None
     summary["pct_queries_with_first_hit_within_top_{0}".format(MAX_K)] = round((queries_with_any_first_hit / summary["scanned_queries"])*100, 2) if summary["scanned_queries"]>0 else 0.0
-    # Score stats
+    
+    # Thống kê điểm (đây là RERANK score)
     if first_hit_scores:
         avg_first_hit_score = statistics.mean(first_hit_scores)
         std_first_hit_score = statistics.pstdev(first_hit_scores)
@@ -410,16 +507,18 @@ def main():
         max_first_hit_score = None
         min_first_hit_score = None
 
-    summary["avg_first_hit_score"] = round(avg_first_hit_score, 4) if avg_first_hit_score is not None else None
-    summary["std_first_hit_score"] = round(std_first_hit_score, 4) if std_first_hit_score is not None else None
-    summary["max_first_hit_score"] = round(max_first_hit_score, 4) if max_first_hit_score is not None else None
-    summary["min_first_hit_score"] = round(min_first_hit_score, 4) if min_first_hit_score is not None else None
-    # simple suggested threshold: mean - stddev (users can choose more conservative value)
-    if avg_first_hit_score is not None and std_first_hit_score is not None:
-        suggested = avg_first_hit_score - std_first_hit_score
-        summary["suggested_score_threshold_mean_minus_std"] = round(suggested, 4)
-    else:
-        summary["suggested_score_threshold_mean_minus_std"] = None
+    score_stats = {
+        "avg_first_hit_rerank_score": round(avg_first_hit_score, 4) if avg_first_hit_score is not None else None,
+        "std_first_hit_rerank_score": round(std_first_hit_score, 4) if std_first_hit_score is not None else None,
+        "max_first_hit_rerank_score": round(max_first_hit_score, 4) if max_first_hit_score is not None else None,
+        "min_first_hit_rerank_score": round(min_first_hit_score, 4) if min_first_hit_score is not None else None
+    }
+    
+    # Reranker BAAI thường có điểm dương cao cho các cặp tốt, và điểm âm cho các cặp xấu.
+    # Ngưỡng 0.0 là một điểm khởi đầu tốt.
+    score_stats["suggested_rerank_score_threshold"] = 0.0
+    summary["first_hit_rerank_score_stats"] = score_stats
+
 
     # 5. Tạo báo cáo cuối cùng
     report = {
@@ -429,12 +528,15 @@ def main():
     
     # 6. Lưu file JSON
     try:
+        # Đảm bảo thư mục results tồn tại
+        os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
+        
         with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
             json.dump(report, f, ensure_ascii=False, indent=4)
         print(f"\nBáo cáo đã được lưu thành công tại: {OUTPUT_FILE}")
         
         # In tóm tắt ra console
-        print("\n--- TÓM TẮT KẾT QUẢ ---")
+        print("\n--- TÓM TẮT KẾT QUẢ (ĐÃ RERANK) ---")
         print(json.dumps(summary, indent=4, ensure_ascii=False))
         
     except Exception as e:
