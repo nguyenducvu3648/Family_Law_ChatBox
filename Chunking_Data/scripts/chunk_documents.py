@@ -87,6 +87,7 @@ EXAMPLES:
     )
     input_group.add_argument(
         "--file",
+        # default="law_content/Quyền dân sự_/Luật Hôn Nhân Gia Đình/Văn bản pháp luật_/luat_hon_nhan_gia_dinh_2014.docx",
         help="Chunk file cụ thể"
     )
     input_group.add_argument(
@@ -98,22 +99,22 @@ EXAMPLES:
     # Metadata options
     parser.add_argument(
         "--law-no",
-        default="",
+        default="52/2014/QH13",
         help="Số hiệu luật (default: empty)"
     )
     parser.add_argument(
         "--issued-date",
-        default="",
+        default="2014-06-19",
         help="Ngày ban hành (YYYY-MM-DD)"
     )
     parser.add_argument(
         "--effective-date",
-        default="",
+        default="2015-01-01",
         help="Ngày có hiệu lực (YYYY-MM-DD)"
     )
     parser.add_argument(
         "--signer",
-        default="",
+        default="Chủ tịch Quốc hội - Nguyễn Sinh Hùng",
         help="Người ký"
     )
     

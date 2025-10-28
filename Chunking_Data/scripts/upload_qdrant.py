@@ -49,27 +49,44 @@ EXAMPLES:
       --chunk-file data/BDS.json \\
       --category BDS \\
       --dry-run
+
+  # Hybrid search mode (multi-vector)
+  python -m Chunking_Data.scripts.upload_qdrant \\
+      --chunk-file data/BDS.json \\
+      --category BDS \\
+      --hybrid \\
+      --model BAAI/bge-m3
         """
     )
     
     # Required arguments
     parser.add_argument(
         "--chunk-file",
-        required=True,
+        # required=True,
+        default="data/luat_hon_nhan_gia_dinh_2014_chunk_180412_241025.json",
+        
         help="Path to chunk JSON file"
     )
     
     parser.add_argument(
         "--category",
-        required=True,
+        # required=True,
+        default="QDS",
         help="Category name for collection (e.g., BDS, QDS)"
     )
     
     # Model options
     parser.add_argument(
         "--model",
-        default="minhquan6203/paraphrase-vietnamese-law",
-        help="Embedding model name (default: minhquan6203/paraphrase-vietnamese-law)"
+        default="BAAI/bge-m3",
+        help="Embedding model name"
+    )
+
+    # Hybrid search option
+    parser.add_argument(
+        "--hybrid",
+        action="store_true",
+        help="Enable hybrid search với multi-vector (dense + sparse + colbert)"
     )
     
     parser.add_argument(
@@ -126,6 +143,11 @@ EXAMPLES:
     print(f"📂 Category: {args.category}")
     print(f"⚙️  Device: {args.device}")
     print(f"📦 Batch size: {args.batch_size}")
+
+    if args.hybrid:
+        print(f"🔍 Hybrid mode: ENABLED (multi-vector)")
+    else:
+        print(f"🔍 Hybrid mode: DISABLED (single vector)")
     
     if args.force_recreate:
         print(f"⚠️  FORCE RECREATE MODE - Will DELETE existing data!")
@@ -153,12 +175,21 @@ EXAMPLES:
             return
         
         # 2. Create pipeline
-        pipeline = EmbeddingPipeline(
-            model_name=args.model,
-            device=args.device,
-            batch_size=args.batch_size,
-            verbose=args.verbose
-        )
+        if args.hybrid:
+            from ..pipeline.hybrid_embedding_pipeline import HybridEmbeddingPipeline
+            pipeline = HybridEmbeddingPipeline(
+                dense_model_name=args.model,
+                device=args.device,
+                batch_size=args.batch_size,
+                verbose=args.verbose
+            )
+        else:
+            pipeline = EmbeddingPipeline(
+                model_name=args.model,
+                device=args.device,
+                batch_size=args.batch_size,
+                verbose=args.verbose
+            )
         
         # 3. Process and upload
         results = pipeline.process_and_upload(
@@ -173,8 +204,14 @@ EXAMPLES:
         print(f"{'='*80}")
         print(f"✅ Collection: {results['collection_name']}")
         print(f"✅ Total vectors: {results['total_vectors']}")
-        print(f"✅ Dimension: {results['vector_dimension']}")
-        print(f"✅ Model: {results['model_name']}")
+
+        if args.hybrid:
+            print(f"✅ Dense dim: {results['dense_dimension']}")
+            print(f"✅ ColBERT dim: {results['colbert_dimension']}")
+            print(f"✅ Models: dense={results['dense_model']}, sparse={results['sparse_model']}, colbert={results['colbert_model']}")
+        else:
+            print(f"✅ Dimension: {results['vector_dimension']}")
+            print(f"✅ Model: {results['model_name']}")
         
     except Exception as e:
         print(f"\n❌ ERROR: {e}")
