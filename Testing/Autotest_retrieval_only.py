@@ -22,8 +22,8 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
 
 # Các hằng số cho bài test
 DATA_FOLDER = "data"
-TEST_DATA_FILE = "HNGD_Test.xlsx"
-OUTPUT_FILE = "results/results_BAAI_retrieval_only.json"
+TEST_DATA_FILE = "HNGD_Full.xlsx"
+OUTPUT_FILE = "results/results_BAAI_HNGD_retrieval_only_V2.json"
 TOP_K_VALUES = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85 ,90, 95, 100, 105, 110, 115, 120, 125, 130, 135, 140, 145, 150 ]
 MAX_K = max(TOP_K_VALUES)
 
@@ -164,9 +164,10 @@ def run_test(
     # 2. Retrieval
     search_results = client.query_points(
         collection_name=COLLECTION_NAME,
-        query_vector=query_vector,
+        query=query_vector,
         limit=MAX_K,
-        with_payload=True
+        with_payload=True,
+        using="bge-m3"
     )
     
     # 3. Chuẩn hóa kết quả retrieve
@@ -200,7 +201,8 @@ def run_test(
             "score": score
         }
 
-    retrieved_payloads = [compact_hit(hit) for hit in search_results[:MAX_K]]
+    top_max_results = search_results.points
+    retrieved_payloads = [compact_hit(hit) for hit in top_max_results]
     
     # 4. So sánh
     hits_at_k = {}
@@ -232,7 +234,7 @@ def run_test(
         return True
 
     # Precompute normalized refs for top MAX_K results
-    top_max_results = search_results[:MAX_K]
+    # top_max_results = search_results[:MAX_K]
     retrieved_refs_all = [normalize_payload_ref(hit.payload) for hit in top_max_results]
 
     # collect scores for top_max_results
