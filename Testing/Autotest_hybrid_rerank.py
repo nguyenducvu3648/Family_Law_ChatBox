@@ -7,6 +7,8 @@ import pandas as pd
 import torch
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
+# THAY ĐỔI: Import thư viện fastembed cho ColBERT
+from fastembed import LateInteractionTextEmbedding
 from dotenv import load_dotenv
 from typing import Set, Tuple, Any, Dict, List, Optional
 from itertools import product # Dùng để tạo lưới tham số
@@ -27,16 +29,16 @@ COLLECTION_NAME = os.getenv("COLLECTION_NAME", "luat_hon_nhan_va_gia_dinh_2014")
 BGE_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
 BGE_VECTOR_NAME = "bge-m3" # Tên index vector Dense
 
-# 2. Mô hình Colbert (Late-Interaction Reranker)
+# 2. Mô hình Colbert (Dùng làm Reranker - Multi-Vector)
 COLBERT_MODEL_NAME = os.getenv("COLBERT_MODEL_NAME", "colbert-ir/colbertv2.0")
-# TÊN INDEX MULTIVECTOR CỦA BẠN (PHẢI LÀ MULTIVECTOR)
-COLBERT_VECTOR_NAME = "colbertv2.0" 
+COLBERT_VECTOR_NAME = "colbertv2.0" # TÊN INDEX MULTI-VECTOR (128-dim)
 
 # 3. Vector BM25 (Sparse Retrieval)
 BM25_VECTOR_NAME = "bm25" # Tên index vector Sparse
+BM25_SPARSE_MODEL_NAME = "Qdrant/bm25"
 # ----------------------------------------------
 
-# THÊM MỚI: Tự động chọn device (GPU nếu có)
+# Tự động chọn device (GPU nếu có)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- Cấu hình LƯỚI TEST (GRID SEARCH) ---
@@ -54,18 +56,26 @@ FINAL_K_AFTER_RERANK = 7
 
 # --- Các Hàm Tiện Ích ---
 
-# Khởi tạo cả 2 mô hình (BGE và Colbert)
-def initialize_clients() -> Tuple[SentenceTransformer, SentenceTransformer, QdrantClient]:
-    """Khởi tạo các mô hình embedding (BGE và Colbert) và Qdrant client."""
+# THAY ĐỔI: Sửa hàm khởi tạo
+def initialize_clients() -> Tuple[SentenceTransformer, LateInteractionTextEmbedding, QdrantClient]:
+    """
+    Khởi tạo mô hình BGE (SentenceTransformer) và
+    Colbert (FastEmbed) và Qdrant client.
+    """
     print(f"Sử dụng device: {DEVICE}")
     
     # 1. Tải mô hình BGE (cho Giai đoạn 1: Retrieve)
     print(f"Đang tải mô hình BGE: {BGE_MODEL_NAME}...")
     bge_model = SentenceTransformer(BGE_MODEL_NAME, device=DEVICE)
     
-    # 2. Tải mô hình Colbert (cho Giai đoạn 2: Rerank)
-    print(f"Đang tải mô hình Colbert: {COLBERT_MODEL_NAME}...")
-    colbert_model = SentenceTransformer(COLBERT_MODEL_NAME, device=DEVICE)
+    # 2. Tải mô hình Colbert (Bằng thư viện FastEmbed)
+    print(f"Đang tải mô hình Colbert (FastEmbed): {COLBERT_MODEL_NAME}...")
+    # FastEmbed's wrapper sẽ tự động xử lý tokenization, 
+    # projection 768->128, chuẩn hóa L2 và trả về multi-vector
+    colbert_model = LateInteractionTextEmbedding(
+        model_name=COLBERT_MODEL_NAME, 
+        device=DEVICE
+    )
     
     # 3. Kết nối Qdrant
     print(f"Đang kết nối tới Qdrant tại: {QDRANT_URL}...")
@@ -79,6 +89,7 @@ def initialize_clients() -> Tuple[SentenceTransformer, SentenceTransformer, Qdra
         print(f"Chi tiết lỗi: {e}")
         raise
         
+    # THAY ĐỔI: Trả về colbert_model của FastEmbed
     return bge_model, colbert_model, client
 
 def load_excel_data(folder_path: str, specific_filename: str) -> pd.DataFrame:
@@ -119,7 +130,6 @@ def parse_references(text: str) -> Set[Tuple[str, str, str]]:
         diem = diem_match.group(1) if diem_match else None
         
         if dieu or khoan or diem:
-            # Chuẩn hóa đơn giản
             dieu_str = str(dieu).lower() if dieu else None
             khoan_str = str(khoan).lower() if khoan else None
             diem_str = str(diem).lower() if diem else None
@@ -147,7 +157,7 @@ def normalize_payload_ref(payload: Dict[str, Any]) -> Tuple[str, str, str]:
 def run_single_test_case(
     client: QdrantClient,
     bge_vector: List[float],
-    colbert_vector: List[float],
+    colbert_multi_vector: List[List[float]], # Đây là colbertv2.0 (multi-vector)
     bm25_query: str,
     ground_truth_refs: Set[Tuple[str, str, str]],
     k_dense: int,
@@ -155,45 +165,50 @@ def run_single_test_case(
     final_k: int
 ) -> bool:
     """
-    Chạy 1 query với 1 cặp (k_dense, k_sparse) và trả về True nếu hit_at_{final_k}.
-    Đây là logic cốt lõi của pipeline "Tiêu chuẩn vàng".
+    Chạy pipeline: (BGE + BM25) Retrieve -> (Colbert-MultiVector) Rerank
     """
     
     try:
-        # 1. Truy vấn Qdrant (Retrieve + Rerank)
         search_results = client.query_points(
             collection_name=COLLECTION_NAME,
-            query=models.QueryRequest(
-                # Giai đoạn 1: Lấy ứng viên (BGE + BM25)
-                prefetch=[
-                    models.Prefetch(
-                        query=models.Nearest(vector=bge_vector),
-                        using=BGE_VECTOR_NAME,
-                        limit=k_dense
-                    ),
-                    models.Prefetch(
-                        query=models.BM25(query=bm25_query),
-                        using=BM25_VECTOR_NAME,
-                        limit=k_sparse
-                    )
-                ],
-                # Giai đoạn 2: Rerank các ứng viên trên bằng Colbert
-                # Lệnh này yêu cầu COLBERT_VECTOR_NAME phải là một index MultiVector
-                query=models.Colbert(
-                    vector=colbert_vector
+            
+            # Giai đoạn 1: Lấy ứng viên (BGE + BM25)
+            prefetch=[
+                models.Prefetch(
+                    query=bge_vector, # Dùng BGE-Dense
+                    using=BGE_VECTOR_NAME,
+                    limit=k_dense
                 ),
-                using=COLBERT_VECTOR_NAME, # Chỉ định index MultiVector để rerank
-                limit=final_k # Lấy {final_k} (ví dụ: 7) kết quả cuối cùng
-            ),
+                models.Prefetch(
+                    query=models.Document(
+                        text=bm25_query,
+                        model=BM25_SPARSE_MODEL_NAME 
+                    ), 
+                    using=BM25_VECTOR_NAME,
+                    limit=k_sparse
+                )
+            ],
+            
+            # Giai đoạn 2: Rerank bằng multi-vector Colbert
+            query=colbert_multi_vector,
+            
+            # Chỉ định Qdrant dùng index 'colbertv2.0' (Multi-Vector)
+            using=COLBERT_VECTOR_NAME, 
+            
+            limit=final_k, # Lấy top 7
             with_payload=True
         )
         
-        # 2. So sánh kết quả Top-{final_k} với Ground Truth
+        # SỬA LỖI: Phải truy cập thuộc tính .points của kết quả trả về
         top_final_k_results = search_results.points
         
         def ground_truth_matches(retrieved_ref, gt_ref) -> bool:
             rd, rk, rp = retrieved_ref
             gd, gk, gp = gt_ref
+            
+            if rd is None and rk is None and rp is None:
+                return False
+                
             if gd is not None and gd != rd: return False
             if gk is not None and gk != rk: return False
             if gp is not None and gp != rp: return False
@@ -214,13 +229,12 @@ def run_single_test_case(
     except Exception as e:
         print(f"Lỗi khi chạy test case (k_dense={k_dense}, k_sparse={k_sparse}): {e}")
         return False
-
-
 # --- Hàm Chính (Thực thi Grid Search) ---
 
 def main():
     """Hàm thực thi chính của quy trình Grid Search."""
     try:
+        # THAY ĐỔI: Nhận về model FastEmbed cho ColBERT
         bge_model, colbert_model, client = initialize_clients()
         df = load_excel_data(DATA_FOLDER, TEST_DATA_FILE)
     except Exception as e:
@@ -230,7 +244,6 @@ def main():
     total_queries = len(df)
     
     # 1. Tạo lưới tham số (các cặp k)
-    # Ví dụ: [(10, 10), (10, 20), (10, 30), (20, 10), (20, 20), ...]
     param_grid = list(product(K_DENSE_VALUES, K_SPARSE_VALUES))
     
     # 2. Khởi tạo cấu trúc báo cáo (ma trận kết quả)
@@ -246,6 +259,9 @@ def main():
     print(f"Các tham số K_SPARSE (BM25): {K_SPARSE_VALUES}")
     print(f"Đánh giá tại K cuối cùng (Sau Rerank): {FINAL_K_AFTER_RERANK}")
 
+    # Biến kiểm tra
+    first_run = True
+
     # Lặp qua từng HÀNG (query) trong DataFrame
     for index, row in df.iterrows():
         query = row["Query"]
@@ -260,8 +276,30 @@ def main():
 
             # 2. Encode query MỘT LẦN (tiết kiệm thời gian)
             bge_vector = bge_model.encode(query, convert_to_tensor=False).tolist()
-            colbert_vector = colbert_model.encode(query, convert_to_tensor=False).tolist()
-            bm25_query = query
+            bm25_query = query # BM25 dùng query text
+
+            # --- SỬA LỖI: Encode ColBERT bằng FastEmbed ---
+            # .query_embed() trả về 1 iterator. next() lấy phần tử đầu tiên (query)
+            # Kết quả là 1 numpy array (num_tokens, 128)
+            colbert_multi_vector_np = next(colbert_model.query_embed(query))
+            # Chuyển sang list[list[float]] mà Qdrant client cần
+            colbert_multi_vector = colbert_multi_vector_np.tolist()
+            # --------------------------------------------------
+
+            # In debug cho lần chạy đầu tiên
+            if first_run:
+                print("\n--- DEBUG (Lần chạy đầu tiên) ---")
+                print(f"Kích thước BGE vector: {len(bge_vector)}")
+                # THAY ĐỔI: Debug cho multi-vector
+                num_tokens = len(colbert_multi_vector)
+                token_dim = len(colbert_multi_vector[0]) if num_tokens > 0 else 0
+                print(f"Kích thước Colbert multi-vector: {num_tokens} tokens x {token_dim} dim")
+                
+                if token_dim != 128:
+                    print(f"CẢNH BÁO: Vector ColBERT có dim={token_dim}, nhưng index của bạn là 128!")
+                print("----------------------------------\n")
+                first_run = False
+
 
             # 3. Lặp qua LƯỚI THAM SỐ
             for (k_dense, k_sparse) in param_grid:
@@ -270,7 +308,7 @@ def main():
                 is_hit = run_single_test_case(
                     client,
                     bge_vector,
-                    colbert_vector,
+                    colbert_multi_vector, # THAY ĐỔI: Truyền multi-vector
                     bm25_query,
                     ground_truth_refs,
                     k_dense,
@@ -302,7 +340,8 @@ def main():
             "final_k_after_rerank": FINAL_K_AFTER_RERANK,
             "bge_model": BGE_MODEL_NAME,
             "colbert_model": COLBERT_MODEL_NAME,
-            "pipeline": "BGE_Retrieve + BM25_Retrieve -> Colbert_Rerank (MultiVector)"
+            # Cập nhật pipeline
+            "pipeline": "BGE_Retrieve + BM25_Retrieve -> Colbert(Multi-Vector)_Rerank"
         },
         "results_grid": {}
     }
