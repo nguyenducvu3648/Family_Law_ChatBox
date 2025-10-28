@@ -5510,8 +5510,8 @@
         {
             "query": "Nguyên tắc có đi có lại không áp dụng trong lĩnh vực hôn nhân và gia đình.",
             "expected_references": [
-                "('124', None, None)",
-                "('ước', None, None)"
+                "('ước', None, None)",
+                "('124', None, None)"
             ],
             "retrieved_top_150": [
                 {
