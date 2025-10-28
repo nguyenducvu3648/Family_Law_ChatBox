@@ -1,0 +1,27 @@
+# Core Dependencies for Chunking_Data Module
+# ============================================
+
+# Document Processing
+python-docx>=0.8.11
+docx2txt>=0.8
+textract>=1.6.5
+pypandoc>=1.11
+
+# JSON & File Operations
+# (built-in modules: json, pathlib, os)
+
+# Qdrant Vector Database
+qdrant-client>=1.7.0
+
+# Embedding Models
+transformers>=4.35.0
+sentence-transformers>=2.2.2
+torch>=2.0.0
+
+# AI Review (Gemini)
+google-generativeai>=0.3.0
+python-dotenv>=1.0.0
+
+# Utilities
+tqdm>=4.65.0
+
