@@ -1,16 +1,10 @@
 import re
 import torch
 from typing import List
-from rank_bm25 import BM25Okapi
 from qdrant_client.http.models import Filter, FieldCondition, MatchValue
 
-from core.config import EMBEDDING_MODEL
 from models.models import rerank_model, rerank_tokenizer
 from utils.utils import _safe_truncate
-
-from memory.cache import embed_cache, search_cache
-
-from models.models import embedder
 
 def rerank_with_baai(query, docs, top_k=15):
     if not docs:
@@ -38,15 +32,6 @@ def rerank_with_baai(query, docs, top_k=15):
 
 def tokenize(text):
     return re.findall(r'\w+', text.lower())
-
-def encode_query(text: str):
-    key = f"{EMBEDDING_MODEL}|query|{text}"
-    v = embed_cache.get(key)
-    if v is not None:
-        return v
-    vec = embedder.encode([f"query: {text}"], normalize_embeddings=True)[0].tolist()
-    embed_cache.set(key, vec)
-    return vec
 
 def _build_filter(query_text: str) -> Filter or None:
     conds: List[FieldCondition] = []

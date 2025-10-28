@@ -1,6 +1,15 @@
-from textwrap import dedent
 from typing import List, Dict, Any
 import re
+import os
+# Import hàm từ prompt_loader (đặt file này ở cùng cấp hoặc trong PYTHONPATH)
+from core.prompt_loader import load_prompt
+
+# Xác định thư mục gốc của agent
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+# -> BASE_DIR = Family-law-chatbot/AI_Agent/Honnhan_Agent
+
+# Gọi load_prompt với folder và loại prompt
+ANSWER_PROMPT = load_prompt(BASE_DIR, "answer")
 
 def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None):
     history_block = ""
@@ -16,7 +25,7 @@ def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None):
     def doc_priority(d):
         text = (d.get("content") or "").lower()
         if re.search(r"\b(trừ khi|ngoại lệ|nếu chưa bị tuyên bố|trường hợp|nhưng không)\b", text):
-            return 0  # Ưu tiên cao
+            return 0
         return 1
 
     docs_sorted = sorted(
@@ -49,25 +58,11 @@ def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None):
 
     context = "\n".join(context_lines) if context_lines else "❌ Không có điều luật nào."
 
-    prompt = dedent(f"""
-    Bạn là trợ lý phân tích pháp luật về Luật Hôn nhân & Gia đình, chỉ dùng trích đoạn trong danh sách sau.
-    Quy tắc:
-    - Câu hỏi Đúng/Sai → trả lời **Kết luận: Đúng/Sai** + lý do.
-    - Câu hỏi thường → trả lời **1–3 câu**, bám sát câu hỏi.
-    - **Trích dẫn nguyên văn** tất cả điều luật liên quan (Điểm–Khoản–Điều + nội dung), theo thứ tự.
-    - Nếu thiếu căn cứ → trả lời: **Không đủ căn cứ.**
-    - Câu hỏi ngoài luật → trả lời lịch sự, ngắn gọn, không viện dẫn luật.
-    - Nếu có điều kiện ngoại lệ (trừ khi, nếu chưa bị tuyên bố, ngoại lệ...) → phải xét ưu tiên phần đó.
-    ĐỊNH DẠNG TRẢ LỜI:
-    - Trích dẫn: <liệt kê toàn bộ điều luật được sử dụng>
-    - Giải thích: <1–3 câu, áp dụng tình huống>
-    - Kết luận: <kết luận ngắn gọn dựa vào câu hỏi, trích dẫn và giải thích>
-
-    Câu hỏi hiện tại:
-    \"\"\"{query}\"\"\"{history_block}
-
-    Danh sách điều luật (top_k):
-    {context}
-    """).strip()
+    # Format vào template đã load
+    prompt = ANSWER_PROMPT.format(
+        query=query,
+        history_block=history_block,
+        context=context
+    )
 
     return prompt
