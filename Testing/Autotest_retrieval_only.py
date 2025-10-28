@@ -22,8 +22,8 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
 
 # Các hằng số cho bài test
 DATA_FOLDER = "data"
-TEST_DATA_FILE = "HNGD_Test.xlsx"
-OUTPUT_FILE = "results/results_BAAI_HNGD_retrieval_only_V1.json"
+TEST_DATA_FILE = "HNGD_Full.xlsx"
+OUTPUT_FILE = "results/results_BAAI_HNGD_retrieval_only_V2.json"
 TOP_K_VALUES = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85 ,90, 95, 100, 105, 110, 115, 120, 125, 130, 135, 140, 145, 150 ]
 MAX_K = max(TOP_K_VALUES)
 
@@ -166,7 +166,8 @@ def run_test(
         collection_name=COLLECTION_NAME,
         query=query_vector,
         limit=MAX_K,
-        with_payload=True
+        with_payload=True,
+        using="bge-m3"
     )
     
     # 3. Chuẩn hóa kết quả retrieve
