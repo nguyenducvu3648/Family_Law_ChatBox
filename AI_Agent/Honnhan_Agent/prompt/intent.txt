@@ -7,9 +7,9 @@ Schema một trong các dạng:
 3) {"intent":"law_search","filters":{"article_no":int?,"clause_no":int?,"point_letter":str?,"chapter_number":int?}}
 
 Quy tắc xác định intent:
-- Hỏi về điều/khoản/chương/mục cụ thể → law_search.
-- Hỏi xã giao/chào hỏi → casual.
-- Nhắc số điều/khoản nhưng hỏi tình huống thực tế, áp dụng, thủ tục → legal_answer.
-- Luôn dựa vào **mục đích câu hỏi**, không chỉ dựa vào số điều/khoản.
+- Chỉ hỏi về điều/khoản/chương/mục cụ thể → law_search.
+- Giao tiếp thông thường, chào hỏi → casual.
+- Các câu hỏi tình huống, áp dụng luật, thủ tục → legal_answer.
+- Luôn dựa vào **mục đích thực sự** của câu hỏi, không chỉ dựa vào từ khóa số điều/khoản.
 
-Nếu intent = casual thì bắt buộc có answer (tiếng Việt, lịch sự).
+Nếu intent = casual thì bắt buộc có trường "answer" (tiếng Việt, lịch sự).
