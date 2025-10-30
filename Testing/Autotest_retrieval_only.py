@@ -22,8 +22,8 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
 
 # Các hằng số cho bài test
 DATA_FOLDER = "data"
-TEST_DATA_FILE = "HNGD_Full.xlsx"
-OUTPUT_FILE = "results/results_BAAI_HNGD_retrieval_only_V2.json"
+TEST_DATA_FILE = "BDS_Test.xlsx"
+OUTPUT_FILE = "results/results_BAAI_BDS_retrieval_only_V1.json"
 TOP_K_VALUES = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85 ,90, 95, 100, 105, 110, 115, 120, 125, 130, 135, 140, 145, 150 ]
 MAX_K = max(TOP_K_VALUES)
 
@@ -63,7 +63,8 @@ def load_excel_data(folder_path: str, specific_filename: str) -> pd.DataFrame:
 
     print(f"Đang đọc file: {file_path}...")
     df = pd.read_excel(file_path, engine='openpyxl')
-    
+    df.columns = df.columns.str.strip()
+    df.columns = df.columns.str.title()
     # 1. Kiểm tra header
     if "Query" not in df.columns or "Positive" not in df.columns:
         raise ValueError("File Excel phải chứa 2 cột bắt buộc: 'Query' và 'Positive'.")
@@ -94,15 +95,27 @@ def parse_references(text: str) -> Set[Tuple[str, str, str]]:
         if not part:
             continue
             
-        # Sử dụng \w+ để bắt được "5", "1", "a"
         dieu_match = re.search(r"Điều\s+(\w+)", part, re.IGNORECASE)
         khoan_match = re.search(r"Khoản\s+(\w+)", part, re.IGNORECASE)
         diem_match = re.search(r"Điểm\s+(\w+)", part, re.IGNORECASE)
-        
+
         dieu = dieu_match.group(1) if dieu_match else None
-        khoan = khoan_match.group(1) if khoan_match else None
-        diem = diem_match.group(1) if diem_match else None
-        
+        khoan_raw = khoan_match.group(1) if khoan_match else None
+        diem_raw = diem_match.group(1) if diem_match else None
+
+        khoan = None
+        if khoan_raw:
+            khoan_num_match = re.match(r"^(\d+)", khoan_raw) # Chỉ lấy số
+            if khoan_num_match:
+                khoan = khoan_num_match.group(1) # Sẽ lấy '15' từ '15a'
+            else:
+                khoan = khoan_raw # Giữ nguyên nếu không phải số (ví dụ: 'IV')
+
+        # 2. Chuẩn hóa Điểm (chỉ lấy chữ cái)
+        diem = None
+        if diem_raw:
+            diem = re.sub(r"[^a-zA-ZđĐ]", "", diem_raw).lower() or None
+
         # Chỉ thêm nếu có ít nhất một thông tin
         if dieu or khoan or diem:
             references.add((dieu, khoan, diem))
@@ -126,12 +139,21 @@ def normalize_payload_ref(payload: Dict[str, Any]) -> Tuple[str, str, str]:
         meta = payload
 
     d = meta.get("article_no")
-    k = meta.get("clause_no")
+    k_raw = meta.get("clause_no") # Đổi tên biến
     p = meta.get("point_letter") or meta.get("point_id") or None
 
-    # Chuẩn hóa: convert số nguyên -> string, giữ None nếu không tồn tại
+    # Chuẩn hóa Điều
     d_str = str(d) if d is not None else None
-    k_str = str(k) if k is not None else None
+
+    # --- LOGIC CHUẨN HÓA MỚI CHO KHOẢN ---
+    k_str = None
+    if k_raw is not None:
+        k_raw_str = str(k_raw).strip()
+        k_num_match = re.match(r"^(\d+)", k_raw_str) # Chỉ lấy số
+        if k_num_match:
+            k_str = k_num_match.group(1)
+        else:
+            k_str = k_raw_str
 
     # point letter normalize: lower-case single letters; if it's like 'a' or 'A' keep it
     if p is None:
@@ -158,16 +180,20 @@ def run_test(
     3. List các payload đã retrieve (để báo cáo lỗi).
     """
     
-    # 1. Embedding
-    query_vector = model.encode(query, convert_to_tensor=False).tolist()
+    # 0. Clean text
+    cleaned_query = query.replace('\x00', '').replace('\u200b', '')
+    cleaned_query = re.sub(r'\s+', ' ', cleaned_query).strip()
     
+    # 1. Embedding
+    query_vector = model.encode(cleaned_query, convert_to_tensor=False).tolist()
+
     # 2. Retrieval
     search_results = client.query_points(
         collection_name=COLLECTION_NAME,
         query=query_vector,
         limit=MAX_K,
         with_payload=True,
-        using="bge-m3"
+        #using="bge-m3"
     )
     
     # 3. Chuẩn hóa kết quả retrieve
