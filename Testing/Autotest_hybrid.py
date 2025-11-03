@@ -4,7 +4,7 @@ import json
 import re
 import statistics
 import pandas as pd
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, models  # <-- THAY ĐỔI 1: Sửa import
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 from typing import Set, Tuple, Any, Dict, List
@@ -17,15 +17,24 @@ load_dotenv()
 # Lấy cấu hình từ biến môi trường
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-COLLECTION_NAME = os.getenv("COLLECTION_NAME", "luat_hon_nhan_va_gia_dinh_2014")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "ten_collection_cua_ban")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
-BGE_VECTOR_NAME = os.getenv("BGE_VECTOR_NAME", "bge-m3")
+
+# --- Hằng số MỚI cho Hybrid Search ---
+# Đặt tên vector của bạn trong Qdrant
+DENSE_VECTOR_NAME = "bge-m3"
+SPARSE_VECTOR_NAME = "bm25"
+BM25_SPARSE_MODEL_NAME = "Qdrant/bm25"
+# Hằng số K cho công thức RRF: 1 / (K + rank). 60 là giá trị phổ biến.
+RRF_RANK_CONST = 60
+# ---
 
 # Các hằng số cho bài test
 DATA_FOLDER = "data"
 TEST_DATA_FILE = "HNGD_Full.xlsx"
-OUTPUT_FILE = "results/results_BAAI_HHNGD_retrieval_only_V2.json"
-TOP_K_VALUES = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85 ,90, 95, 100, 105, 110, 115, 120, 125, 130, 135, 140, 145, 150 ]
+# Đổi tên file output
+OUTPUT_FILE = "results/results_BAAI_HNGD_HYBRID_RRF_V1.json"
+TOP_K_VALUES = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85 ,90, 95, 100]
 MAX_K = max(TOP_K_VALUES)
 
 # --- Các Hàm Tiện Ích ---
@@ -167,6 +176,33 @@ def normalize_payload_ref(payload: Dict[str, Any]) -> Tuple[str, str, str]:
 
     return (d_str, k_str, p_str)
 
+# --- QUY TẮC SO SÁNH (ĐÃ NỚI LỎNG) ---
+def ground_truth_matches(retrieved_ref: Tuple[str,str,str], gt_ref: Tuple[str,str,str]) -> bool:
+    """
+    [QUY TẮC ĐÃ SỬA]
+    Trả về True nếu retrieved_ref khớp với gt_ref.
+    QUY TẮC MỚI: Chỉ kiểm tra Điều và Điểm. Khoản (clause) bị BỎ QUA.
+    Một giá trị None trong ground truth (gt) hoạt động như một wildcard (luôn khớp).
+    """
+    rd, _rk, rp = retrieved_ref # _rk (khoản) không được sử dụng
+    gd, _gk, gp = gt_ref    # _gk (khoản) không được sử dụng
+
+    # 1. So sánh Điều (Article)
+    if gd is not None:
+        if gd != rd: # Bao gồm cả trường hợp rd là None hoặc rd là một số khác
+            return False
+
+    # 2. So sánh Khoản (Clause) - BỊ BỎ QUA
+
+    # 3. So sánh Điểm (Point)
+    if gp is not None:
+        if gp != rp: # Bao gồm cả trường hợp rp là None hoặc rp là chữ cái khác
+            return False
+            
+    # Nếu vượt qua cả 2 bài kiểm tra (Điều và Điểm), thì là True
+    return True
+
+# --- HÀM `run_test` ĐÃ SỬA LỖI BM25 ---
 def run_test(
     query: str, 
     ground_truth_refs: Set[Tuple[str, str, str]], 
@@ -174,50 +210,78 @@ def run_test(
     client: QdrantClient
 ) -> Tuple[Dict[str, bool], bool, List[Dict[str, Any]], Any]:
     """
-    Thực hiện embedding, retrieval và so sánh cho một query.
-    Trả về:
-    1. Dict kết quả hit/miss cho từng mốc K.
-    2. Bool tổng quát: có tìm thấy ở K cao nhất không.
-    3. List các payload đã retrieve (để báo cáo lỗi).
+    Thực hiện embedding, retrieval (HYBRID + RRF) và so sánh.
     """
     
     # 0. Clean text
     cleaned_query = query.replace('\x00', '').replace('\u200b', '')
     cleaned_query = re.sub(r'\s+', ' ', cleaned_query).strip()
     
-    # 1. Embedding
+    # 1. Embedding (Dense)
     query_vector = model.encode(cleaned_query, convert_to_tensor=False).tolist()
 
-    # 2. Retrieval
-    search_results = client.query_points(
+    # 2. Retrieval - Bước 1: Query Dense
+    dense_results = client.query_points(
         collection_name=COLLECTION_NAME,
         query=query_vector,
+        using=DENSE_VECTOR_NAME, # Chỉ định vector dense
         limit=MAX_K,
-        with_payload=True,
-        using=BGE_VECTOR_NAME,  # <-- added: chỉ rõ vector name cho collection hybrid
-        #using="bge-m3"
+        with_payload=True
     )
     
-    # 3. Chuẩn hóa kết quả retrieve
-    # We'll keep a compact view of top MAX_K retrieved items (metadata only) to include in miss reports
+    # --- THAY ĐỔI 3: Sửa logic query Sparse (BM25) ---
+    sparse_query = models.Document(
+        text=cleaned_query,
+        model=BM25_SPARSE_MODEL_NAME
+    )
+    sparse_results = client.query_points(
+        collection_name=COLLECTION_NAME,
+        query=sparse_query, # <-- Dùng đối tượng Document
+        using=SPARSE_VECTOR_NAME, # Chỉ định vector sparse
+        limit=MAX_K,
+        with_payload=True
+    )
+    # --- KẾT THÚC THAY ĐỔI 3 ---
+    
+    # 3. Reciprocal Rank Fusion (RRF)
+    fused_scores = {}
+    all_hits_map = {} # {id: ScoredPoint}
+    
+    # Tính điểm cho kết quả dense
+    for rank, hit in enumerate(dense_results.points, start=1):
+        all_hits_map[hit.id] = hit
+        score = 1.0 / (RRF_RANK_CONST + rank)
+        fused_scores[hit.id] = fused_scores.get(hit.id, 0) + score
+        
+    # Tính điểm cho kết quả sparse
+    for rank, hit in enumerate(sparse_results.points, start=1):
+        if hit.id not in all_hits_map:
+            all_hits_map[hit.id] = hit
+        score = 1.0 / (RRF_RANK_CONST + rank)
+        fused_scores[hit.id] = fused_scores.get(hit.id, 0) + score
+
+    # Sắp xếp các hit theo điểm RRF
+    sorted_hit_ids = sorted(fused_scores, key=fused_scores.get, reverse=True)
+    
+    # Tạo danh sách kết quả cuối cùng, GÁN LẠI ĐIỂM RRF
+    top_max_results = []
+    for hit_id in sorted_hit_ids[:MAX_K]: # Chỉ lấy top MAX_K
+        hit = all_hits_map[hit_id]
+        hit.score = fused_scores[hit_id] # Gán điểm RRF để thống kê
+        top_max_results.append(hit)
+
+    # 4. Chuẩn hóa kết quả retrieve
     def compact_hit(hit) -> Dict[str, Any]:
-        # hit is expected to have .payload (dict)
         payload = hit.payload if hasattr(hit, 'payload') else (hit if isinstance(hit, dict) else {})
         meta = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else payload
 
-        # Normalize values
         art = meta.get('article_no')
         cla = meta.get('clause_no')
         pt = meta.get('point_letter') or meta.get('point_id') or None
         if pt is not None:
             pt = re.sub(r"[^a-zA-ZđĐ]", "", str(pt)).lower() or None
-
-        # try to extract score if present on hit object
-        score = None
-        try:
-            score = getattr(hit, 'score', None)
-        except Exception:
-            score = None
+        
+        score = getattr(hit, 'score', None)
 
         return {
             "id": meta.get('id') or payload.get('id'),
@@ -226,52 +290,23 @@ def run_test(
             "point_letter": pt,
             "article_title": meta.get('article_title'),
             "exact_citation": meta.get('exact_citation'),
-            "score": score
+            "score": score # Đây là điểm RRF
         }
 
-    top_max_results = search_results.points
     retrieved_payloads = [compact_hit(hit) for hit in top_max_results]
     
-    # 4. So sánh
+    # 5. So sánh (Sử dụng logic cũ, nhưng với quy tắc ground_truth_matches MỚI)
     hits_at_k = {}
     found_in_max_k = False
     first_hit_rank = None
     
-    def ground_truth_matches(retrieved_ref: Tuple[str,str,str], gt_ref: Tuple[str,str,str]) -> bool:
-        rd, _rk, rp = retrieved_ref
-        gd, _gk, gp = gt_ref
-
-        if gd is not None:
-            if gd != rd: # Bao gồm cả trường hợp rd là None hoặc rd là một số khác
-                return False
-            
-        if gp is not None:
-            if gp != rp: # Bao gồm cả trường hợp rp là None hoặc rp là chữ cái khác
-                return False
-                
-        return True
-
-    # Precompute normalized refs for top MAX_K results
-    # top_max_results = search_results[:MAX_K]
     retrieved_refs_all = [normalize_payload_ref(hit.payload) for hit in top_max_results]
+    retrieved_scores_all = [hit.score for hit in top_max_results]
 
-    # collect scores for top_max_results
-    retrieved_scores_all = []
-    for hit in top_max_results:
-        sc = None
-        try:
-            sc = getattr(hit, 'score', None)
-        except Exception:
-            sc = None
-        # fallback: if payload contains 'score'
-        if sc is None and isinstance(hit, dict):
-            sc = hit.get('payload', {}).get('score') if isinstance(hit.get('payload', {}), dict) else None
-        retrieved_scores_all.append(sc)
-
-    # determine first hit rank (1-based) and its score if any
     first_hit_score = None
     for idx, rr in enumerate(retrieved_refs_all, start=1):
         for gt in ground_truth_refs:
+            # SỬ DỤNG HÀM SO SÁNH MỚI (CHỈ ĐIỀU, ĐIỂM)
             if ground_truth_matches(rr, gt):
                 first_hit_rank = idx
                 try:
@@ -283,30 +318,25 @@ def run_test(
             break
 
     for k in TOP_K_VALUES:
-        # Lấy K kết quả đầu tiên
-        top_k_results = top_max_results[:k]
-
-        # Chuyển đổi payload của K kết quả đó thành set các tham chiếu
         retrieved_refs_at_k = retrieved_refs_all[:k]
         
-        # Debug: In cho query đầu tiên (sử dụng biến global hoặc flag)
+        # Debug
         try:
             if run_test.debug_count < 1:
                 print(f"DEBUG Query: {query}")
                 print(f"DEBUG Ground truth: {ground_truth_refs}")
-                print(f"DEBUG Retrieved at {k}: {retrieved_refs_at_k}")
+                print(f"DEBUG Retrieved (RRF) at {k}: {retrieved_refs_at_k}")
                 run_test.debug_count += 1
         except AttributeError:
             run_test.debug_count = 1
             print(f"DEBUG Query: {query}")
             print(f"DEBUG Ground truth: {ground_truth_refs}")
-            print(f"DEBUG Retrieved at {k}: {retrieved_refs_at_k}")
+            print(f"DEBUG Retrieved (RRF) at {k}: {retrieved_refs_at_k}")
         
-        # Kiểm tra xem có bất kỳ tham chiếu "ground truth" nào
-        # khớp (với None trong ground truth là wildcard) với các tham chiếu retrieve được
         is_hit = False
         for gt in ground_truth_refs:
             for rr in retrieved_refs_at_k:
+                # SỬ DỤNG HÀM SO SÁNH MỚI (CHỈ ĐIỀU, ĐIỂM)
                 if ground_truth_matches(rr, gt):
                     is_hit = True
                     break
@@ -315,12 +345,12 @@ def run_test(
         
         hits_at_k[f"hit_at_{k}"] = is_hit
         if is_hit:
-            found_in_max_k = True # Đánh dấu đã tìm thấy
+            found_in_max_k = True
             
     return hits_at_k, found_in_max_k, retrieved_payloads, first_hit_rank, first_hit_score
 
 # --- Hàm Chính ---
-
+# (Không cần thay đổi hàm main)
 def main():
     """Hàm thực thi chính của quy trình test."""
     try:
@@ -334,6 +364,11 @@ def main():
     
     # Khởi tạo cấu trúc báo cáo
     summary = {
+        "test_type": "Hybrid RRF",
+        "dense_vector": DENSE_VECTOR_NAME,
+        "sparse_vector": SPARSE_VECTOR_NAME,
+        "bm25_model": BM25_SPARSE_MODEL_NAME, # Thêm thông tin
+        "rrf_k_const": RRF_RANK_CONST,
         "total_queries_in_file": total_queries,
         "scanned_queries": 0,
         "queries_with_no_hit": 0,
@@ -343,9 +378,9 @@ def main():
     missed_queries_details = []
     first_hit_ranks: List[int] = []
     queries_with_any_first_hit = 0
-    first_hit_scores: List[float] = []
+    first_hit_scores: List[float] = [] # Sẽ chứa điểm RRF
 
-    print(f"\n--- BẮT ĐẦU QUÁ TRÌNH TEST ({total_queries} QUERIES) ---")
+    print(f"\n--- BẮT ĐẦU QUÁ TRÌNH TEST HYBRID RRF ({total_queries} QUERIES) ---")
 
     # Lặp qua từng hàng trong DataFrame
     for index, row in df.iterrows():
@@ -360,7 +395,7 @@ def main():
                 print(f"Cảnh báo: Không thể trích xuất tham chiếu từ 'Positive' cho query: '{query}'. Bỏ qua.")
                 continue
 
-            # 2. Chạy test
+            # 2. Chạy test (Hàm này đã được thay thế bằng logic RRF)
             hits_at_k, found_in_max_k, retrieved_payloads, first_hit_rank, first_hit_score = run_test(
                 query, ground_truth_refs, model, client
             )
@@ -374,7 +409,6 @@ def main():
             # 4. Ghi lại các trường hợp "miss"
             if not found_in_max_k:
                 summary["queries_with_no_hit"] += 1
-                # Only include compact retrieved metadata for misses to keep the report focused and smaller
                 missed_queries_details.append({
                     "query": query,
                     "expected_references": [str(ref) for ref in ground_truth_refs],
@@ -390,7 +424,6 @@ def main():
                 except Exception:
                     pass
 
-            # In tiến độ
             if (summary["scanned_queries"] % 10) == 0:
                 print(f"Đã xử lý {summary['scanned_queries']}/{total_queries} queries...")
 
@@ -417,7 +450,8 @@ def main():
 
     summary["avg_first_hit_rank"] = round(avg_first_hit, 2) if avg_first_hit is not None else None
     summary["pct_queries_with_first_hit_within_top_{0}".format(MAX_K)] = round((queries_with_any_first_hit / summary["scanned_queries"])*100, 2) if summary["scanned_queries"]>0 else 0.0
-    # Score stats
+    
+    # Thống kê điểm (Bây giờ là điểm RRF)
     if first_hit_scores:
         avg_first_hit_score = statistics.mean(first_hit_scores)
         std_first_hit_score = statistics.pstdev(first_hit_scores)
@@ -432,8 +466,9 @@ def main():
     summary["avg_first_hit_score"] = round(avg_first_hit_score, 4) if avg_first_hit_score is not None else None
     summary["std_first_hit_score"] = round(std_first_hit_score, 4) if std_first_hit_score is not None else None
     summary["max_first_hit_score"] = round(max_first_hit_score, 4) if max_first_hit_score is not None else None
+    "min_first_hit_score"
     summary["min_first_hit_score"] = round(min_first_hit_score, 4) if min_first_hit_score is not None else None
-    # simple suggested threshold: mean - stddev (users can choose more conservative value)
+    
     if avg_first_hit_score is not None and std_first_hit_score is not None:
         suggested = avg_first_hit_score - std_first_hit_score
         summary["suggested_score_threshold_mean_minus_std"] = round(suggested, 4)
@@ -448,12 +483,14 @@ def main():
     
     # 6. Lưu file JSON
     try:
+        # Đảm bảo thư mục results tồn tại
+        os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
+        
         with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
             json.dump(report, f, ensure_ascii=False, indent=4)
         print(f"\nBáo cáo đã được lưu thành công tại: {OUTPUT_FILE}")
         
-        # In tóm tắt ra console
-        print("\n--- TÓM TẮT KẾT QUẢ ---")
+        print("\n--- TÓM TẮT KẾT QUẢ HYBRID RRF ---")
         print(json.dumps(summary, indent=4, ensure_ascii=False))
         
     except Exception as e:
