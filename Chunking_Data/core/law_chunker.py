@@ -291,7 +291,7 @@ def chunk_law_document(
             "article_title": article_title or None,
             "clause_no": None,
             "clause_intro": None,
-            "point_id": None,
+            "point_id": f"dieu_{article_no}",
             "point_letter": None,
             "exact_citation": exact
         }
@@ -331,7 +331,7 @@ def chunk_law_document(
             "article_title": article_title or None,
             "clause_no": clause_no,
             "clause_intro": clause_intro_current or None,
-            "point_id": None,
+            "point_id": f"dieu_{article_no}_khoan_{clause_no}",
             "point_letter": None,
             "exact_citation": exact
         }
@@ -369,8 +369,8 @@ def chunk_law_document(
             "article_title": article_title or None,
             "clause_no": clause_no,
             "clause_intro": clause_intro_current or None,
-            "point_id": point_id,
-            "point_letter": letter,
+    "point_id": f"dieu_{article_no}_khoan_{clause_no}_diem_{letter}",  # Luôn có cho tất cả chunk types
+    "point_letter": letter,
             "exact_citation": exact
         }
         art_hdr = build_article_header(article_no, article_title)

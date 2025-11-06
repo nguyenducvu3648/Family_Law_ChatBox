@@ -45,7 +45,8 @@ class HybridEmbeddingPipeline:
         colbert_model_name: str = "colbert-ir/colbertv2.0",
         device: str = "cuda",
         batch_size: int = 16,
-        verbose: bool = True
+        verbose: bool = True,
+        vector_config: Optional[Dict[str, bool]] = None
     ):
         """
         Initialize hybrid embedding pipeline.
@@ -57,6 +58,7 @@ class HybridEmbeddingPipeline:
             device: Device để chạy ("cuda" hoặc "cpu")
             batch_size: Batch size cho embedding
             verbose: In log chi tiết
+            vector_config: Dict chỉ định loại vector cần tạo {'dense': bool, 'sparse': bool, 'colbert': bool}
         """
         self.dense_model_name = dense_model_name
         self.sparse_model_name = sparse_model_name
@@ -64,6 +66,13 @@ class HybridEmbeddingPipeline:
         self.device = device
         self.batch_size = batch_size
         self.verbose = verbose
+
+        # Vector configuration - default to all enabled if not specified
+        self.vector_config = vector_config or {
+            'dense': True,
+            'sparse': True,
+            'colbert': True
+        }
 
         # Lazy load models
         self._dense_model = None
@@ -291,10 +300,10 @@ class HybridEmbeddingPipeline:
         if self.verbose:
             print(f"📋 Hybrid collection: {collection_name}")
 
-        # Ensure hybrid collection
+        # Ensure hybrid collection (only get dimensions for enabled vector types)
         try:
-            dense_dim = self.get_dense_dimension()
-            colbert_dim = self.get_colbert_dimension()
+            dense_dim = self.get_dense_dimension() if self.vector_config['dense'] else None
+            colbert_dim = self.get_colbert_dimension() if self.vector_config['colbert'] else None
             ensure_or_append_hybrid_collection(
                 client=client,
                 collection_name=collection_name,
@@ -368,10 +377,25 @@ class HybridEmbeddingPipeline:
         if not texts:
             raise ValueError("No valid texts to embed!")
 
-        # 2. Encode all embedding types
-        dense_embeddings = self.encode_dense(texts)
-        sparse_embeddings = self.encode_sparse(texts)
-        colbert_embeddings = self.encode_colbert(texts)
+        # 2. Encode selected embedding types
+        dense_embeddings = None
+        sparse_embeddings = None
+        colbert_embeddings = None
+
+        if self.vector_config['dense']:
+            if self.verbose:
+                print("🧠 Encoding dense embeddings...")
+            dense_embeddings = self.encode_dense(texts)
+
+        if self.vector_config['sparse']:
+            if self.verbose:
+                print("🔍 Encoding sparse embeddings...")
+            sparse_embeddings = self.encode_sparse(texts)
+
+        if self.vector_config['colbert']:
+            if self.verbose:
+                print("🎯 Encoding ColBERT embeddings...")
+            colbert_embeddings = self.encode_colbert(texts)
 
         # 3. Create collection name
         collection_name = self.create_collection_name(category)
@@ -391,17 +415,30 @@ class HybridEmbeddingPipeline:
         client = get_qdrant_client()
         final_count = count_collection_points(client, collection_name)
 
+        # Build embedding types list based on what was actually created
+        embedding_types = []
+        if self.vector_config['dense']:
+            embedding_types.append('dense')
+        if self.vector_config['sparse']:
+            embedding_types.append('sparse')
+        if self.vector_config['colbert']:
+            embedding_types.append('colbert')
+
         results = {
             'collection_name': collection_name,
             'total_vectors': final_count,
-            'dense_dimension': self.get_dense_dimension(),
-            'colbert_dimension': self.get_colbert_dimension(),
-            'dense_model': self.dense_model_name,
-            'sparse_model': self.sparse_model_name,
-            'colbert_model': self.colbert_model_name,
+            'dense_model': self.dense_model_name if self.vector_config['dense'] else None,
+            'sparse_model': self.sparse_model_name if self.vector_config['sparse'] else None,
+            'colbert_model': self.colbert_model_name if self.vector_config['colbert'] else None,
             'category': category,
-            'embedding_types': ['dense', 'sparse', 'colbert']
+            'embedding_types': embedding_types
         }
+
+        # Add dimensions only if the embeddings were created
+        if self.vector_config['dense']:
+            results['dense_dimension'] = self.get_dense_dimension()
+        if self.vector_config['colbert']:
+            results['colbert_dimension'] = self.get_colbert_dimension()
 
         if self.verbose:
             print(f"\n{'='*80}")
@@ -409,8 +446,10 @@ class HybridEmbeddingPipeline:
             print(f"{'='*80}")
             print(f"✅ Collection: {collection_name}")
             print(f"✅ Vectors: {final_count}")
-            print(f"✅ Dense dim: {results['dense_dimension']}")
-            print(f"✅ ColBERT dim: {results['colbert_dimension']}")
+            if 'dense_dimension' in results:
+                print(f"✅ Dense dim: {results['dense_dimension']}")
+            if 'colbert_dimension' in results:
+                print(f"✅ ColBERT dim: {results['colbert_dimension']}")
             print(f"🔍 Embedding types: {', '.join(results['embedding_types'])}")
 
         return results

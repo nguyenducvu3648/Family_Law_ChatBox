@@ -128,21 +128,25 @@ class ChunkingPipeline:
         self,
         file_paths: List[Dict[str, str]],
         default_law_no: str = "",
+        default_law_title: str = "",
+        default_law_id: str = "",
         default_issued_date: str = "",
         default_effective_date: str = "",
         default_signer: str = ""
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """
         Chunk nhiều files theo batch.
-        
+
         Args:
             file_paths: List file paths (từ find_law_files)
                 Format: [{'path': ..., 'file_name': ..., 'category': ...}, ...]
             default_law_no: Số hiệu luật mặc định
+            default_law_title: Tên luật mặc định (nếu không thì auto từ filename)
+            default_law_id: ID luật mặc định (nếu không thì auto generate)
             default_issued_date: Ngày ban hành mặc định
             default_effective_date: Ngày hiệu lực mặc định
             default_signer: Người ký mặc định
-        
+
         Returns:
             Tuple[all_chunks, summary_stats]
         """
@@ -177,8 +181,8 @@ class ChunkingPipeline:
                 chunks, chunk_stats = self.process_single_file(
                     file_path=file_path,
                     law_no=default_law_no,
-                    law_title=None,  # Auto từ filename
-                    law_id=None,     # Auto generate
+                    law_title=default_law_title or None,  # Use default if provided, else auto từ filename
+                    law_id=default_law_id or None,         # Use default if provided, else auto generate
                     issued_date=default_issued_date,
                     effective_date=default_effective_date,
                     expiry_date=None,

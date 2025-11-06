@@ -73,21 +73,22 @@ EXAMPLES:
   
   # Chunk file cụ thể
   python -m Chunking_Data.scripts.chunk_documents --file "path/to/law.docx"
-  
+
   # Chunk tất cả với validation
   python -m Chunking_Data.scripts.chunk_documents --all --validate
         """
     )
     
     # Input options
-    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group = parser.add_mutually_exclusive_group()
     input_group.add_argument(
         "--category",
+        default="BDS",
         help="Chunk theo category (BDS, DN, TM, QDS)"
     )
     input_group.add_argument(
         "--file",
-        # default="law_content/Quyền dân sự_/Luật Hôn Nhân Gia Đình/Văn bản pháp luật_/luat_hon_nhan_gia_dinh_2014.docx",
+        default="law_content/Bất động sản/Luật Kinh Doanh Bất Động Sản/Văn bản pháp luật_/Luật Kinh doanh bất động sản 2023 .docx",
         help="Chunk file cụ thể"
     )
     input_group.add_argument(
@@ -99,29 +100,39 @@ EXAMPLES:
     # Metadata options
     parser.add_argument(
         "--law-no",
-        default="52/2014/QH13",
-        help="Số hiệu luật (default: empty)"
+        default="29/2023/QH15",
+        help="Số hiệu luật"
+    )
+    parser.add_argument(
+        "--law-title",
+        default="LUẬT KINH DOANH BẤT ĐỘNG SẢN",
+        help="Tên luật"
+    )
+    parser.add_argument(
+        "--law-id",
+        default="LKBDS2023",
+        help="ID luật (unique identifier)"
     )
     parser.add_argument(
         "--issued-date",
-        default="2014-06-19",
+        default="2023-11-28",
         help="Ngày ban hành (YYYY-MM-DD)"
     )
     parser.add_argument(
         "--effective-date",
-        default="2015-01-01",
+        default="2023-11-28",
         help="Ngày có hiệu lực (YYYY-MM-DD)"
     )
     parser.add_argument(
         "--signer",
-        default="Chủ tịch Quốc hội - Nguyễn Sinh Hùng",
+        default="Chủ tịch Quốc hội - Vương Đình Huệ",
         help="Người ký"
     )
     
     # Output options
     parser.add_argument(
         "--output-dir",
-        default="data",
+        default="data/bds",
         help="Output directory (default: data)"
     )
     parser.add_argument(
@@ -219,6 +230,22 @@ EXAMPLES:
     
     print(f"📁 Files to process: {len(file_paths)}")
     print(f"📂 Output directory: {args.output_dir}")
+
+    # Show metadata info
+    if args.law_title or args.law_no or args.law_id:
+        print(f"📋 Metadata:")
+        if args.law_title:
+            print(f"   - Law Title: {args.law_title}")
+        if args.law_no:
+            print(f"   - Law No: {args.law_no}")
+        if args.law_id:
+            print(f"   - Law ID: {args.law_id}")
+        if args.issued_date:
+            print(f"   - Issued Date: {args.issued_date}")
+        if args.effective_date:
+            print(f"   - Effective Date: {args.effective_date}")
+        if args.signer:
+            print(f"   - Signer: {args.signer}")
     
     if args.dry_run:
         print(f"🔍 DRY RUN MODE - No files will be written")
@@ -240,6 +267,8 @@ EXAMPLES:
     chunks, summary = pipeline.process_files(
         file_paths=file_paths,
         default_law_no=args.law_no,
+        default_law_title=args.law_title,
+        default_law_id=args.law_id,
         default_issued_date=args.issued_date,
         default_effective_date=args.effective_date,
         default_signer=args.signer

@@ -50,12 +50,29 @@ EXAMPLES:
       --category BDS \\
       --dry-run
 
-  # Hybrid search mode (multi-vector)
+  # Dense + Sparse hybrid (keyword + semantic)
   python -m Chunking_Data.scripts.upload_qdrant \\
       --chunk-file data/BDS.json \\
       --category BDS \\
-      --hybrid \\
-      --model BAAI/bge-m3
+      --dense-sparse
+
+  # Dense + ColBERT hybrid (semantic + reranking)
+  python -m Chunking_Data.scripts.upload_qdrant \\
+      --chunk-file data/BDS.json \\
+      --category BDS \\
+      --dense-colbert
+
+  # Full hybrid (dense + sparse + colbert)
+  python -m Chunking_Data.scripts.upload_qdrant \\
+      --chunk-file data/BDS.json \\
+      --category BDS \\
+      --hybrid
+
+  # Only BM25 sparse retrieval
+  python -m Chunking_Data.scripts.upload_qdrant \\
+      --chunk-file data/BDS.json \\
+      --category BDS \\
+      --sparse-only
         """
     )
     
@@ -82,11 +99,37 @@ EXAMPLES:
         help="Embedding model name"
     )
 
-    # Hybrid search option
-    parser.add_argument(
+    # Vector type options (mutually exclusive)
+    vector_group = parser.add_mutually_exclusive_group()
+    vector_group.add_argument(
+        "--dense-only",
+        action="store_true",
+        help="Chỉ tạo dense embeddings (semantic retrieval)"
+    )
+    vector_group.add_argument(
+        "--sparse-only",
+        action="store_true",
+        help="Chỉ tạo sparse embeddings (BM25 keyword retrieval)"
+    )
+    vector_group.add_argument(
+        "--colbert-only",
+        action="store_true",
+        help="Chỉ tạo ColBERT embeddings (contextual reranking)"
+    )
+    vector_group.add_argument(
+        "--dense-sparse",
+        action="store_true",
+        help="Tạo dense + sparse embeddings (hybrid keyword + semantic)"
+    )
+    vector_group.add_argument(
+        "--dense-colbert",
+        action="store_true",
+        help="Tạo dense + ColBERT embeddings (semantic + reranking)"
+    )
+    vector_group.add_argument(
         "--hybrid",
         action="store_true",
-        help="Enable hybrid search với multi-vector (dense + sparse + colbert)"
+        help="Tạo tất cả 3 loại embeddings (dense + sparse + colbert) - DEFAULT"
     )
     
     parser.add_argument(
@@ -130,7 +173,37 @@ EXAMPLES:
     )
     
     args = parser.parse_args()
-    
+
+    # Determine vector types to create
+    # Default to hybrid if no specific option selected
+    vector_config = {
+        'dense': False,
+        'sparse': False,
+        'colbert': False
+    }
+
+    if args.dense_only:
+        vector_config['dense'] = True
+    elif args.sparse_only:
+        vector_config['sparse'] = True
+    elif args.colbert_only:
+        vector_config['colbert'] = True
+    elif args.dense_sparse:
+        vector_config['dense'] = True
+        vector_config['sparse'] = True
+    elif args.dense_colbert:
+        vector_config['dense'] = True
+        vector_config['colbert'] = True
+    else:
+        # Default: hybrid (all three) or dense only
+        if args.hybrid:
+            vector_config['dense'] = True
+            vector_config['sparse'] = True
+            vector_config['colbert'] = True
+        else:
+            # Default to dense only if no hybrid option
+            vector_config['dense'] = True
+
     # Fix: --force-recreate override --append
     if args.force_recreate:
         args.append = False
@@ -144,10 +217,23 @@ EXAMPLES:
     print(f"⚙️  Device: {args.device}")
     print(f"📦 Batch size: {args.batch_size}")
 
-    if args.hybrid:
-        print(f"🔍 Hybrid mode: ENABLED (multi-vector)")
+    # Show vector types
+    vector_types = []
+    if vector_config['dense']:
+        vector_types.append("dense")
+    if vector_config['sparse']:
+        vector_types.append("sparse (BM25)")
+    if vector_config['colbert']:
+        vector_types.append("colbert (rerank)")
+
+    print(f"🔍 Vector types: {', '.join(vector_types)}")
+
+    # Determine if using hybrid pipeline
+    use_hybrid = vector_config['sparse'] or vector_config['colbert']
+    if use_hybrid:
+        print(f"🔄 Pipeline: HYBRID")
     else:
-        print(f"🔍 Hybrid mode: DISABLED (single vector)")
+        print(f"🔄 Pipeline: STANDARD")
     
     if args.force_recreate:
         print(f"⚠️  FORCE RECREATE MODE - Will DELETE existing data!")
@@ -175,13 +261,14 @@ EXAMPLES:
             return
         
         # 2. Create pipeline
-        if args.hybrid:
+        if use_hybrid:
             from ..pipeline.hybrid_embedding_pipeline import HybridEmbeddingPipeline
             pipeline = HybridEmbeddingPipeline(
                 dense_model_name=args.model,
                 device=args.device,
                 batch_size=args.batch_size,
-                verbose=args.verbose
+                verbose=args.verbose,
+                vector_config=vector_config
             )
         else:
             pipeline = EmbeddingPipeline(
@@ -205,13 +292,20 @@ EXAMPLES:
         print(f"✅ Collection: {results['collection_name']}")
         print(f"✅ Total vectors: {results['total_vectors']}")
 
-        if args.hybrid:
-            print(f"✅ Dense dim: {results['dense_dimension']}")
-            print(f"✅ ColBERT dim: {results['colbert_dimension']}")
-            print(f"✅ Models: dense={results['dense_model']}, sparse={results['sparse_model']}, colbert={results['colbert_model']}")
+        if use_hybrid:
+            # Hybrid pipeline results
+            if 'dense_dimension' in results:
+                print(f"✅ Dense dim: {results['dense_dimension']}")
+            if 'colbert_dimension' in results:
+                print(f"✅ ColBERT dim: {results['colbert_dimension']}")
+            print(f"✅ Models: dense={results.get('dense_model', 'N/A')}, sparse={results.get('sparse_model', 'N/A')}, colbert={results.get('colbert_model', 'N/A')}")
         else:
-            print(f"✅ Dimension: {results['vector_dimension']}")
-            print(f"✅ Model: {results['model_name']}")
+            # Standard pipeline results
+            if 'vector_dimension' in results:
+                print(f"✅ Dimension: {results['vector_dimension']}")
+                print(f"✅ Model: {results.get('model_name', 'N/A')}")
+            else:
+                print(f"✅ Results keys: {list(results.keys())}")  # Debug
         
     except Exception as e:
         print(f"\n❌ ERROR: {e}")

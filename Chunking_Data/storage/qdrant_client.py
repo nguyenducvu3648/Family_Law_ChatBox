@@ -237,8 +237,8 @@ def ensure_or_append_collection(
 def ensure_hybrid_collection(
     client: QdrantClient,
     collection_name: str,
-    dense_dim: int,
-    colbert_dim: int
+    dense_dim: Optional[int],
+    colbert_dim: Optional[int]
 ) -> None:
     """
     Tạo mới hybrid collection với multi-vector config.
@@ -246,31 +246,31 @@ def ensure_hybrid_collection(
     Args:
         client: QdrantClient instance
         collection_name: Tên collection
-        dense_dim: Dimension của dense vector (bge-m3)
-        colbert_dim: Dimension của ColBERT vector per token
+        dense_dim: Dimension của dense vector (bge-m3), None nếu không sử dụng
+        colbert_dim: Dimension của ColBERT vector per token, None nếu không sử dụng
     """
-    # Hybrid collection config với 3 loại vector
-    vectors_config = {
-        # Dense vector: BAAI/bge-m3
-        "bge-m3": VectorParams(
+    # Hybrid collection config - chỉ tạo vectors cho enabled types
+    vectors_config = {}
+
+    if dense_dim is not None:
+        vectors_config["bge-m3"] = VectorParams(
             size=dense_dim,
             distance=Distance.COSINE,
-        ),
-        # ColBERT vector: Multi-vector cho late interaction
-        "colbertv2.0": VectorParams(
+        )
+
+    if colbert_dim is not None:
+        vectors_config["colbertv2.0"] = VectorParams(
             size=colbert_dim,
             distance=Distance.COSINE,
             multivector_config=MultiVectorConfig(
                 comparator=MultiVectorComparator.MAX_SIM,
             ),
             hnsw_config=HnswConfigDiff(m=0)  # Tắt HNSW vì không cần cho rerank
-        ),
-    }
+        )
 
-    sparse_vectors_config = {
-        # Sparse vector: BM25-style
-        "bm25": SparseVectorParams(modifier=Modifier.IDF)
-    }
+    sparse_vectors_config = {}
+    # Always include sparse config for now (can be made optional later)
+    sparse_vectors_config["bm25"] = SparseVectorParams(modifier=Modifier.IDF)
 
     # Recreate collection
     client.recreate_collection(
@@ -280,9 +280,15 @@ def ensure_hybrid_collection(
     )
 
     print(f"🔍 Hybrid collection ready: {collection_name}")
-    print(f"   Dense (bge-m3): {dense_dim} dims")
+    if dense_dim is not None:
+        print(f"   Dense (bge-m3): {dense_dim} dims")
+    else:
+        print(f"   Dense (bge-m3): DISABLED")
     print(f"   Sparse (bm25): keyword-based")
-    print(f"   ColBERT: {colbert_dim} dims per token")
+    if colbert_dim is not None:
+        print(f"   ColBERT: {colbert_dim} dims per token")
+    else:
+        print(f"   ColBERT: DISABLED")
 
     # Create payload indexes
     try:
@@ -317,8 +323,8 @@ def ensure_hybrid_collection(
 def ensure_or_append_hybrid_collection(
     client: QdrantClient,
     collection_name: str,
-    dense_dim: int,
-    colbert_dim: int,
+    dense_dim: Optional[int],
+    colbert_dim: Optional[int],
     append_mode: bool = False
 ) -> bool:
     """
@@ -327,8 +333,8 @@ def ensure_or_append_hybrid_collection(
     Args:
         client: QdrantClient instance
         collection_name: Tên collection
-        dense_dim: Dimension của dense vector
-        colbert_dim: Dimension của ColBERT vector
+        dense_dim: Dimension của dense vector (None nếu không sử dụng)
+        colbert_dim: Dimension của ColBERT vector (None nếu không sử dụng)
         append_mode: True = append, False = recreate
 
     Returns:
@@ -462,9 +468,9 @@ def upsert_embeddings_to_qdrant(
 def upsert_hybrid_embeddings_to_qdrant(
     client: QdrantClient,
     collection_name: str,
-    dense_embeddings: np.ndarray,
-    sparse_embeddings: List[Dict[str, Any]],
-    colbert_embeddings: List[np.ndarray],
+    dense_embeddings: Optional[np.ndarray],
+    sparse_embeddings: Optional[List[Dict[str, Any]]],
+    colbert_embeddings: Optional[List[np.ndarray]],
     law_docs: List[Dict[str, Any]],
     batch_size: int = 100
 ) -> None:
@@ -477,20 +483,22 @@ def upsert_hybrid_embeddings_to_qdrant(
     Args:
         client: QdrantClient instance
         collection_name: Tên collection
-        dense_embeddings: Dense vectors (numpy array, shape: n_docs x dense_dim)
-        sparse_embeddings: Sparse vectors (list of dicts with 'indices' and 'values')
-        colbert_embeddings: ColBERT vectors (list of numpy arrays, shape: seq_len x colbert_dim)
+        dense_embeddings: Dense vectors (numpy array, shape: n_docs x dense_dim) or None
+        sparse_embeddings: Sparse vectors (list of dicts with 'indices' and 'values') or None
+        colbert_embeddings: ColBERT vectors (list of numpy arrays, shape: seq_len x colbert_dim) or None
         law_docs: List chunks với metadata (phải có field "id")
         batch_size: Batch size cho upload
 
     Raises:
         ValueError: Nếu document thiếu field "id", business ID invalid, hoặc mismatch dimensions
     """
-    if len(dense_embeddings) != len(law_docs) or len(sparse_embeddings) != len(law_docs) or len(colbert_embeddings) != len(law_docs):
-        raise ValueError(
-            f"Mismatch: {len(dense_embeddings)} dense, {len(sparse_embeddings)} sparse, "
-            f"{len(colbert_embeddings)} colbert vs {len(law_docs)} documents"
-        )
+    # Validate dimensions for non-None embeddings
+    if dense_embeddings is not None and len(dense_embeddings) != len(law_docs):
+        raise ValueError(f"Dense embeddings count mismatch: {len(dense_embeddings)} vs {len(law_docs)} documents")
+    if sparse_embeddings is not None and len(sparse_embeddings) != len(law_docs):
+        raise ValueError(f"Sparse embeddings count mismatch: {len(sparse_embeddings)} vs {len(law_docs)} documents")
+    if colbert_embeddings is not None and len(colbert_embeddings) != len(law_docs):
+        raise ValueError(f"ColBERT embeddings count mismatch: {len(colbert_embeddings)} vs {len(law_docs)} documents")
 
     print(f"📤 Uploading {len(law_docs)} hybrid vectors in batches of {batch_size}...")
 
@@ -506,28 +514,28 @@ def upsert_hybrid_embeddings_to_qdrant(
     # Batch upload (sử dụng UUID từ business ID)
     for i in tqdm(range(0, len(law_docs), batch_size), desc="Uploading hybrid"):
         batch_docs = law_docs[i:i + batch_size]
-        batch_dense = dense_embeddings[i:i + batch_size]
-        batch_sparse = sparse_embeddings[i:i + batch_size]
-        batch_colbert = colbert_embeddings[i:i + batch_size]
+        batch_dense = dense_embeddings[i:i + batch_size] if dense_embeddings is not None else [None] * len(batch_docs)
+        batch_sparse = sparse_embeddings[i:i + batch_size] if sparse_embeddings is not None else [None] * len(batch_docs)
+        batch_colbert = colbert_embeddings[i:i + batch_size] if colbert_embeddings is not None else [None] * len(batch_docs)
 
         points = []
-        for j, (doc, dense_vec, sparse_vec, colbert_vec) in enumerate(zip(batch_docs, batch_dense, batch_sparse, batch_colbert)):
-            point_id = doc["_uuid"]  # UUID từ business ID 
+        for j, doc in enumerate(batch_docs):
+            point_id = doc["_uuid"]  # UUID từ business ID
 
-            # Create hybrid vector payload
-            vector_payload = {
-                # Dense vector
-                "bge-m3": dense_vec.tolist(),
+            # Create hybrid vector payload - only include enabled vector types
+            vector_payload = {}
 
-                # Sparse vector
-                "bm25": SparseVector(
-                    indices=sparse_vec['indices'],
-                    values=sparse_vec['values']
-                ),
+            if dense_embeddings is not None:
+                vector_payload["bge-m3"] = batch_dense[j].tolist()
 
-                # ColBERT multi-vector (list of token embeddings)
-                "colbertv2.0": colbert_vec.tolist()  # Shape: (seq_len, dim)
-            }
+            if sparse_embeddings is not None:
+                vector_payload["bm25"] = SparseVector(
+                    indices=batch_sparse[j]['indices'],
+                    values=batch_sparse[j]['values']
+                )
+
+            if colbert_embeddings is not None:
+                vector_payload["colbertv2.0"] = batch_colbert[j].tolist()  # Shape: (seq_len, dim)
 
             points.append(PointStruct(
                 id=point_id,
