@@ -12,7 +12,8 @@ from dotenv import load_dotenv
 from typing import Set, Tuple, Any, Dict, List, Optional
 from itertools import product
 # THÊM MỚI: Cần defaultdict để tính RRF
-from collections import defaultdict
+# (KHÔNG CÒN CẦN THIẾT KHI DÙNG PREFETCH)
+# from collections import defaultdict 
 
 # --- Cấu hình và Hằng số ---
 
@@ -34,72 +35,27 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DATA_FOLDER = "data"
 TEST_DATA_FILE = "HNGD_Full.xlsx"
 # THAY ĐỔI: Tên file output mới
-OUTPUT_FILE = "results/results_HNGD_RRF_Rerank_V2.json"
+OUTPUT_FILE = "results/results_HNGD_V2.json" # Đổi tên file output
 
 K_DENSE_VALUES = [10, 20, 30, 50, 70, 100]
 K_SPARSE_VALUES = [10, 20, 30, 50, 70, 100]
 FINAL_K_AFTER_RERANK = 7
 
 # --- CẤU HÌNH MỚI CHO PIPELINE CẢI TIẾN ---
-RRF_K_CONST = 60
-# Số lượng ứng viên TỐI ĐA từ RRF để đưa vào ColBERT rerank
-# Chúng ta sẽ lấy top 30 ứng viên tốt nhất từ RRF để rerank
-K_CANDIDATES_FROM_RRF = 30 
+# (KHÔNG CẦN CÁC HẰNG SỐ RRF/K_CANDIDATES KHI DÙNG PREFETCH)
+# RRF_K_CONST = 60
+# K_CANDIDATES_FROM_RRF = 30 
 # ----------------------------------------------
 
 # --- HÀM MỚI: Reciprocal Rank Fusion (RRF) ---
-def reciprocal_rank_fusion(
-    results_lists: List[List[models.ScoredPoint]], 
-    k_const: int = 60
-) -> Dict[str, float]:
-    """
-    Tính điểm RRF từ nhiều danh sách kết quả (đã có điểm số từ Qdrant).
-    Trả về một dict {id: rrf_score} đã sắp xếp.
-    """
-    rrf_scores = defaultdict(float)
-    
-    # Lặp qua từng danh sách kết quả (ví dụ: [bge_results, bm25_results])
-    for results in results_lists:
-        for idx, point in enumerate(results):
-            rank = idx + 1
-            rrf_scores[point.id] += (1.0 / (k_const + rank))
-            
-    # Sắp xếp các ứng viên theo điểm RRF giảm dần
-    sorted_rrf_scores = dict(sorted(rrf_scores.items(), key=lambda item: item[1], reverse=True))
-    return sorted_rrf_scores
+# (KHÔNG CẦN THIẾT - QDRANT PREFETCH SẼ THAY THẾ LOGIC NÀY)
+# def reciprocal_rank_fusion(...):
+#     ...
 
 # --- HÀM MỚI: Tính điểm ColBERT Client-side ---
-def calculate_colbert_similarity(
-    query_vectors: List[List[float]], 
-    doc_vectors: List[List[float]],
-    device: str
-) -> float:
-    """
-    Tính điểm tương đồng ColBERT (MaxSim) giữa query và document
-    trên client-side (thay vì server-side).
-    """
-    try:
-        # Chuyển sang tensor
-        query_tensor = torch.tensor(query_vectors, dtype=torch.float32).to(device)
-        doc_tensor = torch.tensor(doc_vectors, dtype=torch.float32).to(device)
-
-        # Chuẩn hóa L2 (quan trọng cho ColBERT)
-        query_tensor = torch.nn.functional.normalize(query_tensor, p=2, dim=1)
-        doc_tensor = torch.nn.functional.normalize(doc_tensor, p=2, dim=1)
-
-        # Tính toán ma trận tương đồng (tích vô hướng)
-        sim_matrix = torch.matmul(query_tensor, doc_tensor.T)
-
-        # Lấy MaxSim (lấy giá trị max của mỗi token query)
-        max_sim_scores, _ = torch.max(sim_matrix, dim=1)
-        
-        # Tổng điểm MaxSim
-        final_score = torch.sum(max_sim_scores).item()
-        
-        return final_score
-    except Exception as e:
-        print(f"Lỗi khi tính ColBERT sim: {e}")
-        return 0.0
+# (KHÔNG CẦN THIẾT - QDRANT SERVER SẼ TÍNH TOÁN)
+# def calculate_colbert_similarity(...):
+#     ...
 
 # --- Các Hàm Tiện Ích (Giữ nguyên) ---
 def initialize_clients() -> Tuple[SentenceTransformer, LateInteractionTextEmbedding, QdrantClient]:
@@ -162,7 +118,7 @@ def normalize_payload_ref(payload: Dict[str, Any]) -> Tuple[str, str, str]:
     return (d_str, k_str, p_str)
 
 def ground_truth_matches(retrieved_ref, gt_ref) -> bool:
-    # (Hàm này được chuyển vào trong `run_single_test_case` để dễ sử dụng)
+    # (Giữ nguyên hàm này)
     rd, rk, rp = retrieved_ref
     gd, gk, gp = gt_ref
     if rd is None and rk is None and rp is None: return False
@@ -171,7 +127,7 @@ def ground_truth_matches(retrieved_ref, gt_ref) -> bool:
     if gp is not None and gp != rp: return False
     return True
 
-# --- HÀM TEST CHÍNH (ĐÃ VIẾT LẠI) ---
+# --- HÀM TEST CHÍNH (ĐÃ VIẾT LẠI HOÀN TOÀN ĐỂ DÙNG PREFETCH) ---
 def run_single_test_case(
     client: QdrantClient,
     bge_vector: List[float],
@@ -180,80 +136,77 @@ def run_single_test_case(
     ground_truth_refs: Set[Tuple[str, str, str]],
     k_dense: int,
     k_sparse: int,
-    k_candidates_from_rrf: int,
+    # k_candidates_from_rrf: int, # KHÔNG CẦN NỮA
     final_k: int
 ) -> bool:
     """
-    Chạy pipeline MỚI: 
-    (BGE + BM25) Retrieve -> (Client-side) RRF -> (Client-side) Colbert Rerank
+    Chạy pipeline MỚI sử dụng PREFETCH:
+    Prefetch: (BGE + BM25) -> Main Query: (Colbert Rerank)
+    Tất cả được thực thi trên Server Qdrant trong 1 lệnh gọi.
     """
     
     try:
-        # --- BƯỚC 1: LẤY BGE (DENSE) ---
-        bge_results = client.query_points(
-            collection_name=COLLECTION_NAME,
+        # --- BƯỚC 1: ĐỊNH NGHĨA CÁC PREFETCH QUERIES ---
+        
+        # Prefetch 1: BGE (Dense)
+        # Đây là truy vấn để "đề cử" ứng viên
+        prefetch_bge = models.Prefetch(
             query=bge_vector,
             using=BGE_VECTOR_NAME,
-            limit=k_dense,
-            with_payload=False, # Không cần payload ở bước này
-            with_vectors=False
-        ).points
-
-        # --- BƯỚC 2: LẤY BM25 (SPARSE) ---
-        bm25_results = client.query_points(
-            collection_name=COLLECTION_NAME,
+            limit=k_dense
+        )
+        
+        # Prefetch 2: BM25 (Sparse)
+        # Đây cũng là truy vấn "đề cử" ứng viên
+        prefetch_bm25 = models.Prefetch(
             query=models.Document(text=bm25_query, model=BM25_SPARSE_MODEL_NAME),
             using=BM25_VECTOR_NAME,
-            limit=k_sparse,
-            with_payload=False,
-            with_vectors=False
-        ).points
-
-        # --- BƯỚC 3: CHẠY RRF (CLIENT-SIDE) ---
-        rrf_scores = reciprocal_rank_fusion(
-            [bge_results, bm25_results], 
-            k_const=RRF_K_CONST
+            limit=k_sparse
         )
         
-        # --- BƯỚC 4: LẤY TOP ỨNG VIÊN TỪ RRF ---
-        top_rrf_ids = list(rrf_scores.keys())[:k_candidates_from_rrf]
+        # Qdrant sẽ tự động lấy TẬP HỢP (UNION) 
+        # của kết quả từ prefetch_bge và prefetch_bm25
+
+        # --- BƯỚC 2: XÂY DỰNG QUERY REQUEST HOÀN CHỈNH ---
         
-        if not top_rrf_ids:
-            return False # Không có ứng viên nào
-
-        # --- BƯỚC 5: LẤY VECTORS COLBERT + PAYLOAD ĐỂ RERANK ---
-        # Lấy payload và vector ColBERT của các ứng viên
-        retrieved_points = client.retrieve(
-            collection_name=COLLECTION_NAME,
-            ids=top_rrf_ids,
-            with_payload=True,
-            with_vectors=[COLBERT_VECTOR_NAME] # Chỉ lấy vector ColBERT
-        )
-
-        # --- BƯỚC 6: RERANK BẰNG COLBERT (CLIENT-SIDE) ---
-        reranked_results = []
-        for point in retrieved_points:
-            if COLBERT_VECTOR_NAME not in point.vector:
-                print(f"Cảnh báo: ID {point.id} không có vector {COLBERT_VECTOR_NAME}. Bỏ qua.")
-                continue
-                
-            doc_vectors = point.vector[COLBERT_VECTOR_NAME]
+        # Query chính (ColBERT) sẽ hoạt động như một RERANKER.
+        # Nó chỉ chạy trên các điểm được trả về bởi các prefetch.
+        
+        # query_request = models.QueryRequest(
+        #     # Danh sách các truy vấn đề cử (candidate nomination)
+        #     prefetch=[prefetch_bge, prefetch_bm25],
             
-            # Tính điểm ColBERT
-            score = calculate_colbert_similarity(
-                colbert_multi_vector,
-                doc_vectors,
-                DEVICE
-            )
-            reranked_results.append((point, score))
+        #     # Query chính (Reranker)
+        #     query=colbert_multi_vector,
+        #     using=COLBERT_VECTOR_NAME, 
+            
+        #     # Lấy K cuối cùng
+        #     limit=final_k,
+            
+        #     # Cần payload để kiểm tra ground truth
+        #     with_payload=True,
+        # )
 
-        # --- BƯỚC 7: SẮP XẾP CUỐI CÙNG ---
-        reranked_results.sort(key=lambda x: x[1], reverse=True)
+        # --- BƯỚC 3: CHẠY QUERY DUY NHẤT ---
+        # Đây là API mới, thay thế cho .search()
+        results = client.query_points(
+            collection_name=COLLECTION_NAME,
+            
+            # --- Các tham số "bung" ra từ QueryRequest cũ ---
+            prefetch=[prefetch_bge, prefetch_bm25],
+            query=colbert_multi_vector,
+            using=COLBERT_VECTOR_NAME, 
+            limit=final_k,
+            with_payload=True,
+            # ---------------------------------------------
+            
+            with_vectors=False # Tham số này đã đúng vị trí
+        )
         
-        # Lấy top K cuối cùng (chỉ lấy đối tượng 'point')
-        top_final_k_results = [point for point, score in reranked_results[:final_k]]
+        # Kết quả trả về đã được sắp xếp theo điểm ColBERT (query chính)
+        top_final_k_results = results.points
         
-        # --- BƯỚC 8: KIỂM TRA GROUND TRUTH ---
+        # --- BƯỚC 4: KIỂM TRA GROUND TRUTH ---
         is_hit_at_k = False
         for hit in top_final_k_results:
             retrieved_ref = normalize_payload_ref(hit.payload)
@@ -267,7 +220,10 @@ def run_single_test_case(
         return is_hit_at_k
 
     except Exception as e:
-        print(f"Lỗi khi chạy test case (k_dense={k_dense}, k_sparse={k_sparse}): {e}")
+        print(f"Lỗi khi chạy test case (k_dense={k_dense}, k_sparse={k_sparse}) với PREFETCH: {e}")
+        # In chi tiết lỗi để debug
+        import traceback
+        traceback.print_exc()
         return False
 
 # --- HÀM CHÍNH (ĐÃ CẬP NHẬT) ---
@@ -291,10 +247,11 @@ def main():
             f"hit_at_{FINAL_K_AFTER_RERANK}": 0
         }
     
-    print(f"\n--- BẮT ĐẦU GRID SEARCH (PIPELINE CẢI TIẾN: RRF + RERANK) ---")
-    print(f"Các tham số K_DENSE (BGE): {K_DENSE_VALUES}")
-    print(f"Các tham số K_SPARSE (BM25): {K_SPARSE_VALUES}")
-    print(f"Số ứng viên RRF đưa vào Rerank: {K_CANDIDATES_FROM_RRF}")
+    # Cập nhật log
+    print(f"\n--- BẮT ĐẦU GRID SEARCH (PIPELINE PREFETCH QDRANT) ---")
+    print(f"Các tham số K_DENSE (BGE Prefetch): {K_DENSE_VALUES}")
+    print(f"Các tham số K_SPARSE (BM25 Prefetch): {K_SPARSE_VALUES}")
+    print(f"Query chính (Reranker): {COLBERT_VECTOR_NAME}")
     print(f"Đánh giá tại K cuối cùng (Sau Rerank): {FINAL_K_AFTER_RERANK}")
 
     first_run = True
@@ -333,9 +290,8 @@ def main():
                     colbert_multi_vector,
                     bm25_query,
                     ground_truth_refs,
-                    k_dense,                   # Input cho BGE
-                    k_sparse,                  # Input cho BM25
-                    K_CANDIDATES_FROM_RRF,     # Input cho Reranker
+                    k_dense,                   # Input cho BGE Prefetch
+                    k_sparse,                  # Input cho BM25 Prefetch
                     FINAL_K_AFTER_RERANK       # Output cuối cùng
                 )
                 
@@ -357,12 +313,12 @@ def main():
             "total_queries_processed": total_queries,
             "k_dense_values": K_DENSE_VALUES,
             "k_sparse_values": K_SPARSE_VALUES,
-            "k_candidates_from_rrf": K_CANDIDATES_FROM_RRF,
+            # "k_candidates_from_rrf": K_CANDIDATES_FROM_RRF, # Không còn
             "final_k_after_rerank": FINAL_K_AFTER_RERANK,
             "bge_model": BGE_MODEL_NAME,
             "colbert_model": COLBERT_MODEL_NAME,
             # Cập nhật pipeline
-            "pipeline": "BGE+BM25 -> Client-RRF -> Client-Colbert_Rerank"
+            "pipeline": "Prefetch(BGE+BM25) -> Server-Colbert_Rerank"
         },
         "results_grid": {}
     }
