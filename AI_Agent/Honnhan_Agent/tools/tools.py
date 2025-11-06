@@ -34,17 +34,30 @@ def tokenize(text):
     return re.findall(r'\w+', text.lower())
 
 def _build_filter(query_text: str) -> Filter or None:
+    """
+    Build Qdrant filter từ query text.
+    Sử dụng metadata.* path cho các trường nested.
+    """
     conds: List[FieldCondition] = []
+    
+    # Tìm Điều
     m = re.search(r"(?i)\bđiều\s*(\d+)\b", query_text)
     if m:
-        conds.append(FieldCondition(key="article_no", match=MatchValue(value=int(m.group(1)))))
+        conds.append(FieldCondition(key="metadata.article_no", match=MatchValue(value=int(m.group(1)))))
+    
+    # Tìm Khoản
     m = re.search(r"(?i)\bkhoản\s*(\d+)\b", query_text)
     if m:
-        conds.append(FieldCondition(key="clause_no", match=MatchValue(value=int(m.group(1)))))
+        conds.append(FieldCondition(key="metadata.clause_no", match=MatchValue(value=int(m.group(1)))))
+    
+    # Tìm Điểm
     m = re.search(r"(?i)\bđiểm\s*([a-z])\b", query_text)
     if m:
-        conds.append(FieldCondition(key="point_letter", match=MatchValue(value=m.group(1).lower())))
+        conds.append(FieldCondition(key="metadata.point_letter", match=MatchValue(value=m.group(1).lower())))
+    
+    # Tìm Chương
     m = re.search(r"(?i)\bchương\s*(\d+)\b", query_text)
     if m:
-        conds.append(FieldCondition(key="chapter_number", match=MatchValue(value=int(m.group(1)))))
+        conds.append(FieldCondition(key="metadata.chapter_number", match=MatchValue(value=int(m.group(1)))))
+    
     return Filter(must=conds) if conds else None

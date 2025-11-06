@@ -25,7 +25,9 @@ ANSWER_PROMPT = load_prompt(BASE_DIR, "answer")
 client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=True)
 
 # Load models từ fastembed (thay thế SentenceTransformer)
-dense_embedding_model = TextEmbedding("sentence-transformers/all-MiniLM-L6-v2")
+embedding_model_name = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+
+dense_embedding_model = TextEmbedding(embedding_model_name)
 sparse_embedding_model = SparseTextEmbedding("Qdrant/bm25")
 late_interaction_embedding_model = LateInteractionTextEmbedding("colbert-ir/colbertv2.0")
 

@@ -4,12 +4,20 @@ Trả về **JSON thuần** (không markdown, không lời dẫn).
 Schema một trong các dạng:
 1) {"intent":"casual","answer":"..."}
 2) {"intent":"legal_answer","normalized_query":"...","original_query":"..."}
-3) {"intent":"law_search","filters":{"article_no":int?,"clause_no":int?,"point_letter":str?,"chapter_number":int?}}
+3) {"intent":"law_search","query_type":"fetch|compare|definition","filters":{"article_no":int?,"clause_no":int?,"point_letter":str?,"chapter_number":int?},"normalized_query":"...","original_query":"..."}
 
 Quy tắc xác định intent:
-- Chỉ hỏi về điều/khoản/chương/mục cụ thể → law_search.
+- Chỉ hỏi về điều/khoản/chương/điểm cụ thể → law_search với query_type="fetch" và điền filters.
+- So sánh/phân biệt các điều khoản hoặc khái niệm luật (ví dụ: "so sánh ly hôn đơn phương và thuận tình", "phân biệt tài sản chung và riêng") → law_search với query_type="compare", không cần filters.
+- Giải thích khái niệm pháp lý (ví dụ: "tài sản chung là gì?", "ly hôn đơn phương nghĩa là gì?", "quyền nuôi con được quy định như thế nào?") → law_search với query_type="definition", không cần filters.
 - Giao tiếp thông thường, chào hỏi → casual.
-- Các câu hỏi tình huống, áp dụng luật, thủ tục → legal_answer.
+- Các câu hỏi tình huống, áp dụng luật, thủ tục, xin tư vấn → legal_answer.
 - Luôn dựa vào **mục đích thực sự** của câu hỏi, không chỉ dựa vào từ khóa số điều/khoản.
 
+Với law_search:
+- Nếu hỏi điều/khoản/điểm/chương CỤ THỂ → query_type="fetch", phải điền filters
+- Nếu so sánh/phân biệt → query_type="compare", không điền filters
+- Nếu giải thích khái niệm/định nghĩa → query_type="definition", không điền filters
+
 Nếu intent = casual thì bắt buộc có trường "answer" (tiếng Việt, lịch sự).
+Nếu intent = law_search thì bắt buộc có "query_type" và "normalized_query".

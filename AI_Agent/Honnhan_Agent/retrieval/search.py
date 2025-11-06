@@ -60,7 +60,7 @@ async def search_law(query: str, top_k: int = 10, score_threshold: float = 0.42)
             collection_name=COLLECTION_NAME,
             prefetch=prefetch,
             query=late_vectors,
-            using="ColBERT-v2",
+            using="colbertv2.0",
             query_filter=flt,
             with_payload=True,
             limit=20,
@@ -69,12 +69,16 @@ async def search_law(query: str, top_k: int = 10, score_threshold: float = 0.42)
         colbert_docs = []
         for point in results.points:
             payload = point.payload or {}
+            # Lấy metadata
+            meta = payload.get("metadata", {})
+            
             colbert_docs.append({
-                "chapter_number": payload.get("chapter_number", ""),
-                "article_no": payload.get("article_no", ""),
-                "article_title": payload.get("article_title", ""),
-                "clause_no": payload.get("clause_no", ""),
-                "point_letter": payload.get("point_letter", ""),
+                "chapter_number": meta.get("chapter_number", ""),
+                "chapter": meta.get("chapter", ""),
+                "article_no": meta.get("article_no", ""),
+                "article_title": meta.get("article_title", ""),
+                "clause_no": meta.get("clause_no", ""),
+                "point_letter": meta.get("point_letter", ""),
                 "content": (payload.get("content") or "").strip(),
                 "colbert_score": point.score,
             })
