@@ -13,7 +13,7 @@ load_dotenv()
 
 QDRANT_URL = os.getenv("QDRANT_URL", "").strip()
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "").strip()
-COLLECTION_NAME = os.getenv("COLLECTION_NAME", "family_law_collection")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL_ID = os.getenv("GEMINI_MODEL_ID", "gemini-2.5-flash")
@@ -1467,4 +1467,3 @@ if __name__ == "__main__":
                 # loop ends for this question
         except KeyboardInterrupt:
             print("\nThoát. ")
-
