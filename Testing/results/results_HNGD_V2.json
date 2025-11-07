@@ -1,0 +1,176 @@
+{
+    "test_config": {
+        "test_file": "HNGD_Full.xlsx",
+        "total_queries_processed": 5926,
+        "k_dense_values": [
+            10,
+            20,
+            30,
+            50,
+            70,
+            100
+        ],
+        "k_sparse_values": [
+            10,
+            20,
+            30,
+            50,
+            70,
+            100
+        ],
+        "final_k_after_rerank": 7,
+        "bge_model": "BAAI/bge-m3",
+        "colbert_model": "colbert-ir/colbertv2.0",
+        "pipeline": "Prefetch(BGE+BM25) -> Server-Colbert_Rerank"
+    },
+    "results_grid": {
+        "dense_10_sparse_10": {
+            "hit_count": 5348,
+            "recall_at_7_percent": 90.25
+        },
+        "dense_10_sparse_20": {
+            "hit_count": 5214,
+            "recall_at_7_percent": 87.99
+        },
+        "dense_10_sparse_30": {
+            "hit_count": 5158,
+            "recall_at_7_percent": 87.04
+        },
+        "dense_10_sparse_50": {
+            "hit_count": 5105,
+            "recall_at_7_percent": 86.15
+        },
+        "dense_10_sparse_70": {
+            "hit_count": 5095,
+            "recall_at_7_percent": 85.98
+        },
+        "dense_10_sparse_100": {
+            "hit_count": 5086,
+            "recall_at_7_percent": 85.83
+        },
+        "dense_20_sparse_10": {
+            "hit_count": 5278,
+            "recall_at_7_percent": 89.07
+        },
+        "dense_20_sparse_20": {
+            "hit_count": 5192,
+            "recall_at_7_percent": 87.61
+        },
+        "dense_20_sparse_30": {
+            "hit_count": 5143,
+            "recall_at_7_percent": 86.79
+        },
+        "dense_20_sparse_50": {
+            "hit_count": 5103,
+            "recall_at_7_percent": 86.11
+        },
+        "dense_20_sparse_70": {
+            "hit_count": 5094,
+            "recall_at_7_percent": 85.96
+        },
+        "dense_20_sparse_100": {
+            "hit_count": 5086,
+            "recall_at_7_percent": 85.83
+        },
+        "dense_30_sparse_10": {
+            "hit_count": 5225,
+            "recall_at_7_percent": 88.17
+        },
+        "dense_30_sparse_20": {
+            "hit_count": 5168,
+            "recall_at_7_percent": 87.21
+        },
+        "dense_30_sparse_30": {
+            "hit_count": 5131,
+            "recall_at_7_percent": 86.58
+        },
+        "dense_30_sparse_50": {
+            "hit_count": 5100,
+            "recall_at_7_percent": 86.06
+        },
+        "dense_30_sparse_70": {
+            "hit_count": 5094,
+            "recall_at_7_percent": 85.96
+        },
+        "dense_30_sparse_100": {
+            "hit_count": 5086,
+            "recall_at_7_percent": 85.83
+        },
+        "dense_50_sparse_10": {
+            "hit_count": 5165,
+            "recall_at_7_percent": 87.16
+        },
+        "dense_50_sparse_20": {
+            "hit_count": 5136,
+            "recall_at_7_percent": 86.67
+        },
+        "dense_50_sparse_30": {
+            "hit_count": 5119,
+            "recall_at_7_percent": 86.38
+        },
+        "dense_50_sparse_50": {
+            "hit_count": 5099,
+            "recall_at_7_percent": 86.04
+        },
+        "dense_50_sparse_70": {
+            "hit_count": 5094,
+            "recall_at_7_percent": 85.96
+        },
+        "dense_50_sparse_100": {
+            "hit_count": 5086,
+            "recall_at_7_percent": 85.83
+        },
+        "dense_70_sparse_10": {
+            "hit_count": 5139,
+            "recall_at_7_percent": 86.72
+        },
+        "dense_70_sparse_20": {
+            "hit_count": 5123,
+            "recall_at_7_percent": 86.45
+        },
+        "dense_70_sparse_30": {
+            "hit_count": 5113,
+            "recall_at_7_percent": 86.28
+        },
+        "dense_70_sparse_50": {
+            "hit_count": 5095,
+            "recall_at_7_percent": 85.98
+        },
+        "dense_70_sparse_70": {
+            "hit_count": 5090,
+            "recall_at_7_percent": 85.89
+        },
+        "dense_70_sparse_100": {
+            "hit_count": 5086,
+            "recall_at_7_percent": 85.83
+        },
+        "dense_100_sparse_10": {
+            "hit_count": 5127,
+            "recall_at_7_percent": 86.52
+        },
+        "dense_100_sparse_20": {
+            "hit_count": 5112,
+            "recall_at_7_percent": 86.26
+        },
+        "dense_100_sparse_30": {
+            "hit_count": 5105,
+            "recall_at_7_percent": 86.15
+        },
+        "dense_100_sparse_50": {
+            "hit_count": 5095,
+            "recall_at_7_percent": 85.98
+        },
+        "dense_100_sparse_70": {
+            "hit_count": 5090,
+            "recall_at_7_percent": 85.89
+        },
+        "dense_100_sparse_100": {
+            "hit_count": 5086,
+            "recall_at_7_percent": 85.83
+        }
+    },
+    "best_configuration": {
+        "key": "dense_10_sparse_10",
+        "recall_at_7_percent": 90.25
+    }
+}
