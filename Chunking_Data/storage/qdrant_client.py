@@ -272,8 +272,19 @@ def ensure_hybrid_collection(
     # Always include sparse config for now (can be made optional later)
     sparse_vectors_config["bm25"] = SparseVectorParams(modifier=Modifier.IDF)
 
-    # Recreate collection
-    client.recreate_collection(
+    # Check if collection exists
+    try:
+        existing_info = get_collection_info(client, collection_name)
+        if existing_info:
+            # Collection exists, delete it first
+            print(f"🗑️  Deleting existing collection: {collection_name}")
+            client.delete_collection(collection_name)
+    except Exception as e:
+        # Collection doesn't exist or other error, continue with creation
+        pass
+
+    # Create new collection
+    client.create_collection(
         collection_name=collection_name,
         vectors_config=vectors_config,
         sparse_vectors_config=sparse_vectors_config

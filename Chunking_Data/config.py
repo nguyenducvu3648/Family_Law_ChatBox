@@ -30,7 +30,7 @@ SUPPORTED_MODELS = {
     "BAAI/bge-m3": {
         "type": "transformers",
         "description": "Multilingual model (BAAI)",
-        "dimension": 1024
+        "dimension": 1024  # Model thực tế output 1024 dims
     },
     "sentence-transformers/paraphrase-multilingual-mpnet-base-v2": {
         "type": "sentence_transformers",

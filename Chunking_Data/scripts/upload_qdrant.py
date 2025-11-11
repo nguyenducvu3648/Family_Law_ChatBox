@@ -44,6 +44,12 @@ EXAMPLES:
       --category BDS \\
       --force-recreate
   
+  # Custom collection name
+  python -m Chunking_Data.scripts.upload_qdrant \\
+      --chunk-file data/BDS.json \\
+      --category BDS \\
+      --collection-name my_custom_collection
+
   # Dry run (test mà không upload)
   python -m Chunking_Data.scripts.upload_qdrant \\
       --chunk-file data/BDS.json \\
@@ -90,6 +96,11 @@ EXAMPLES:
         # required=True,
         default="QDS",
         help="Category name for collection (e.g., BDS, QDS)"
+    )
+
+    parser.add_argument(
+        "--collection-name",
+        help="Custom collection name (overrides auto-generated name)"
     )
     
     # Model options
@@ -174,6 +185,14 @@ EXAMPLES:
     
     args = parser.parse_args()
 
+    # Sanitize collection name if provided
+    if args.collection_name:
+        # Replace invalid characters with underscores
+        args.collection_name = args.collection_name.replace('/', '_').replace('\\', '_').replace(' ', '_')
+        # Remove any other invalid characters, keep only alphanumeric, hyphens, underscores
+        import re
+        args.collection_name = re.sub(r'[^a-zA-Z0-9_-]', '', args.collection_name)
+
     # Determine vector types to create
     # Default to hybrid if no specific option selected
     vector_config = {
@@ -214,6 +233,8 @@ EXAMPLES:
     print(f"📁 Chunk file: {args.chunk_file}")
     print(f"🤖 Model: {args.model}")
     print(f"📂 Category: {args.category}")
+    if hasattr(args, 'collection_name') and args.collection_name:
+        print(f"📋 Collection: {args.collection_name} (custom, sanitized)")
     print(f"⚙️  Device: {args.device}")
     print(f"📦 Batch size: {args.batch_size}")
 
@@ -282,7 +303,8 @@ EXAMPLES:
         results = pipeline.process_and_upload(
             chunks=chunks,
             category=args.category,
-            append_mode=args.append
+            append_mode=args.append,
+            collection_name=args.collection_name
         )
         
         # 4. Summary

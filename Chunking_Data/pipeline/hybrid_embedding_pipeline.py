@@ -340,15 +340,17 @@ class HybridEmbeddingPipeline:
         self,
         chunks: List[Dict[str, Any]],
         category: str,
-        append_mode: bool = True
+        append_mode: bool = True,
+        collection_name: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         End-to-end hybrid embedding pipeline.
 
         Args:
             chunks: List chunks đã được tạo
-            category: Category name (để tạo collection name)
+            category: Category name (để tạo collection name nếu không có custom)
             append_mode: True = append, False = recreate
+            collection_name: Custom collection name (optional)
 
         Returns:
             Dict kết quả với hybrid info
@@ -398,7 +400,12 @@ class HybridEmbeddingPipeline:
             colbert_embeddings = self.encode_colbert(texts)
 
         # 3. Create collection name
-        collection_name = self.create_collection_name(category)
+        if collection_name:
+            # Use custom collection name
+            final_collection_name = collection_name
+        else:
+            # Auto-generate collection name
+            final_collection_name = self.create_collection_name(category)
 
         # 4. Upload to hybrid collection
         self.upload_to_hybrid_collection(
@@ -406,14 +413,14 @@ class HybridEmbeddingPipeline:
             dense_embeddings=dense_embeddings,
             sparse_embeddings=sparse_embeddings,
             colbert_embeddings=colbert_embeddings,
-            collection_name=collection_name,
+            collection_name=final_collection_name,
             append_mode=append_mode
         )
 
         # 5. Return results
         from ..storage.qdrant_client import get_qdrant_client, count_collection_points
         client = get_qdrant_client()
-        final_count = count_collection_points(client, collection_name)
+        final_count = count_collection_points(client, final_collection_name)
 
         # Build embedding types list based on what was actually created
         embedding_types = []
@@ -425,7 +432,7 @@ class HybridEmbeddingPipeline:
             embedding_types.append('colbert')
 
         results = {
-            'collection_name': collection_name,
+            'collection_name': final_collection_name,
             'total_vectors': final_count,
             'dense_model': self.dense_model_name if self.vector_config['dense'] else None,
             'sparse_model': self.sparse_model_name if self.vector_config['sparse'] else None,

@@ -222,15 +222,17 @@ class EmbeddingPipeline:
         self,
         chunks: List[Dict[str, Any]],
         category: str,
-        append_mode: bool = True
+        append_mode: bool = True,
+        collection_name: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         End-to-end: Extract texts → Encode → Upload.
         
         Args:
             chunks: List chunks đã được tạo
-            category: Category name (để tạo collection name)
+            category: Category name (để tạo collection name nếu không có custom)
             append_mode: True = append, False = recreate
+            collection_name: Custom collection name (optional)
         
         Returns:
             Dict kết quả với keys:
@@ -267,23 +269,28 @@ class EmbeddingPipeline:
         embeddings = self.encode_texts(texts)
         
         # 4. Create collection name
-        collection_name = self.create_collection_name(category)
+        if collection_name:
+            # Use custom collection name
+            final_collection_name = collection_name
+        else:
+            # Auto-generate collection name
+            final_collection_name = self.create_collection_name(category)
         
         # 5. Upload to Qdrant
         self.upload_to_qdrant(
             chunks=chunks,
             embeddings=embeddings,
-            collection_name=collection_name,
+            collection_name=final_collection_name,
             append_mode=append_mode
         )
-        
+
         # 6. Return results
         from ..storage.qdrant_client import get_qdrant_client, count_collection_points
         client = get_qdrant_client()
-        final_count = count_collection_points(client, collection_name)
-        
+        final_count = count_collection_points(client, final_collection_name)
+
         results = {
-            'collection_name': collection_name,
+            'collection_name': final_collection_name,
             'total_vectors': final_count,
             'vector_dimension': vector_size,
             'model_name': self.model_name,
