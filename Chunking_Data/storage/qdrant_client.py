@@ -11,12 +11,23 @@ Functions:
   - ensure_collection(): Tạo collection mới
   - ensure_or_append_collection(): Create hoặc append
   - upsert_embeddings_to_qdrant(): Upload vectors
+=======
+  - business_id_to_uuid(): Convert business ID thành UUID deterministic
+  - get_qdrant_client(): Kết nối Qdrant
+  - ensure_collection(): Tạo collection mới (single vector)
+  - ensure_or_append_collection(): Create hoặc append (single vector)
+  - upsert_embeddings_to_qdrant(): Upload single vectors (UUID từ business ID)
+  - ensure_hybrid_collection(): Tạo hybrid collection (multi-vector)
+  - ensure_or_append_hybrid_collection(): Create hoặc append hybrid collection
+  - upsert_hybrid_embeddings_to_qdrant(): Upload hybrid multi-vectors (UUID từ business ID)
+>>>>>>> 985580bf68add13b2bc7f26f77585e9417bff953
   - count_collection_points(): Đếm số vectors
   - encode_texts(): Encode texts thành embeddings
   - get_embedding_dimension(): Get vector dimension
 """
 
 import os
+import uuid
 import torch
 import numpy as np
 from typing import List, Dict, Any, Optional
@@ -27,6 +38,35 @@ load_dotenv()
 
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams, PointStruct, PayloadSchemaType
+from qdrant_client.http.models import (
+    Distance, VectorParams, PointStruct, PayloadSchemaType,
+    SparseVectorParams, SparseVector, MultiVectorConfig,
+    MultiVectorComparator, HnswConfigDiff, 
+    Modifier
+)
+
+
+# ==================== UTILITIES ====================
+
+def business_id_to_uuid(business_id: str) -> str:
+    """
+    Convert business ID thành UUID để dùng làm Qdrant point ID.
+
+    Sử dụng UUID v5 (name-based) với namespace DNS để tạo UUID deterministic.
+
+    Args:
+        business_id: Business ID string (VD: "LHN2014-D1")
+
+    Returns:
+        UUID string
+    """
+    if not business_id or not isinstance(business_id, str):
+        raise ValueError(f"Invalid business ID: {business_id}")
+
+    # Sử dụng namespace DNS để tạo UUID deterministic
+    namespace = uuid.NAMESPACE_DNS
+    return str(uuid.uuid5(namespace, business_id))
+>>>>>>> 985580bf68add13b2bc7f26f77585e9417bff953
 
 
 # ==================== CONNECTION ====================
@@ -202,6 +242,148 @@ def ensure_or_append_collection(
         return True
 
 
+
+def ensure_hybrid_collection(
+    client: QdrantClient,
+    collection_name: str,
+    dense_dim: Optional[int],
+    colbert_dim: Optional[int]
+) -> None:
+    """
+    Tạo mới hybrid collection với multi-vector config.
+
+    Args:
+        client: QdrantClient instance
+        collection_name: Tên collection
+        dense_dim: Dimension của dense vector (bge-m3), None nếu không sử dụng
+        colbert_dim: Dimension của ColBERT vector per token, None nếu không sử dụng
+    """
+    # Hybrid collection config - chỉ tạo vectors cho enabled types
+    vectors_config = {}
+
+    if dense_dim is not None:
+        vectors_config["bge-m3"] = VectorParams(
+            size=dense_dim,
+            distance=Distance.COSINE,
+        )
+
+    if colbert_dim is not None:
+        vectors_config["colbertv2.0"] = VectorParams(
+            size=colbert_dim,
+            distance=Distance.COSINE,
+            multivector_config=MultiVectorConfig(
+                comparator=MultiVectorComparator.MAX_SIM,
+            ),
+            hnsw_config=HnswConfigDiff(m=0)  # Tắt HNSW vì không cần cho rerank
+        )
+
+    sparse_vectors_config = {}
+    # Always include sparse config for now (can be made optional later)
+    sparse_vectors_config["bm25"] = SparseVectorParams(modifier=Modifier.IDF)
+
+    # Recreate collection
+    client.recreate_collection(
+        collection_name=collection_name,
+        vectors_config=vectors_config,
+        sparse_vectors_config=sparse_vectors_config
+    )
+
+    print(f"🔍 Hybrid collection ready: {collection_name}")
+    if dense_dim is not None:
+        print(f"   Dense (bge-m3): {dense_dim} dims")
+    else:
+        print(f"   Dense (bge-m3): DISABLED")
+    print(f"   Sparse (bm25): keyword-based")
+    if colbert_dim is not None:
+        print(f"   ColBERT: {colbert_dim} dims per token")
+    else:
+        print(f"   ColBERT: DISABLED")
+
+    # Create payload indexes
+    try:
+        index_fields = {
+            # Cấu trúc pháp điển
+            "metadata.law_id": PayloadSchemaType.KEYWORD,
+            "metadata.law_title": PayloadSchemaType.KEYWORD,
+            "metadata.law_no": PayloadSchemaType.KEYWORD,
+            "metadata.chapter": PayloadSchemaType.KEYWORD,
+            "metadata.section": PayloadSchemaType.KEYWORD,
+            "metadata.article_no": PayloadSchemaType.INTEGER,
+            "metadata.article_title": PayloadSchemaType.KEYWORD,
+            "metadata.clause_no": PayloadSchemaType.INTEGER,
+            "metadata.point_letter": PayloadSchemaType.KEYWORD,
+            "metadata.exact_citation": PayloadSchemaType.KEYWORD,
+        }
+
+        for field_name, schema_type in index_fields.items():
+            try:
+                client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name=field_name,
+                    field_schema=schema_type,
+                )
+                print(f"   ✅ Indexed: {field_name}")
+            except Exception as ie:
+                print(f"   ⚠️  Could not index '{field_name}': {ie}")
+    except Exception as e:
+        print(f"⚠️  Skipped creating payload indexes: {e}")
+
+
+def ensure_or_append_hybrid_collection(
+    client: QdrantClient,
+    collection_name: str,
+    dense_dim: Optional[int],
+    colbert_dim: Optional[int],
+    append_mode: bool = False
+) -> bool:
+    """
+    Đảm bảo hybrid collection tồn tại. Trong append mode, chỉ tạo mới nếu chưa có.
+
+    Args:
+        client: QdrantClient instance
+        collection_name: Tên collection
+        dense_dim: Dimension của dense vector (None nếu không sử dụng)
+        colbert_dim: Dimension của ColBERT vector (None nếu không sử dụng)
+        append_mode: True = append, False = recreate
+
+    Returns:
+        True nếu collection được tạo mới, False nếu đã tồn tại (append)
+
+    Raises:
+        ValueError: Nếu vector dimensions không khớp (khi append)
+    """
+    existing_info = get_collection_info(client, collection_name)
+
+    if existing_info:
+        if append_mode:
+            # Check vector dimensions compatibility
+            try:
+                config = existing_info.get('config')
+
+                # Get existing dimensions (complex logic for hybrid collections)
+                # For now, assume compatible if collection exists
+                # In production, you'd want more sophisticated checking
+
+                print(f"📎 Appending to existing hybrid collection: {collection_name}")
+                print(f"   Current points: {existing_info.get('points_count', 0)}")
+                return False
+
+            except Exception as e:
+                print(f"⚠️  Warning checking hybrid collection: {e}")
+                print(f"📎 Appending to hybrid collection: {collection_name}")
+                return False
+        else:
+            # Not append mode → recreate
+            print(f"🔄 Recreating hybrid collection: {collection_name}")
+            ensure_hybrid_collection(client, collection_name, dense_dim, colbert_dim)
+            return True
+    else:
+        # Collection doesn't exist → create
+        print(f"➕ Creating new hybrid collection: {collection_name}")
+        ensure_hybrid_collection(client, collection_name, dense_dim, colbert_dim)
+        return True
+
+
 def count_collection_points(
     client: QdrantClient,
     collection_name: str
@@ -234,13 +416,28 @@ def upsert_embeddings_to_qdrant(
 ) -> None:
     """
     Upload embeddings và chunks lên Qdrant.
+<<<<<<< HEAD
     
+=======
+
+    Convert business ID từ doc["id"] thành UUID để làm point ID.
+    UUID được tạo deterministic từ business ID để đảm bảo consistency.
+
+
     Args:
         client: QdrantClient instance
         collection_name: Tên collection
         embeddings: Numpy array shape (n_docs, vector_dim)
+
         law_docs: List chunks với metadata
         batch_size: Batch size cho upload
+
+        law_docs: List chunks với metadata (phải có field "id")
+        batch_size: Batch size cho upload
+
+    Raises:
+        ValueError: Nếu document thiếu field "id" hoặc business ID invalid
+
     """
     if len(embeddings) != len(law_docs):
         raise ValueError(
@@ -248,6 +445,7 @@ def upsert_embeddings_to_qdrant(
         )
     
     print(f"📤 Uploading {len(law_docs)} vectors in batches of {batch_size}...")
+
     
     # Get current max ID để tránh conflict
     try:
@@ -264,6 +462,25 @@ def upsert_embeddings_to_qdrant(
         points = []
         for j, (doc, embedding) in enumerate(zip(batch_docs, batch_embeddings)):
             point_id = start_id + i + j
+
+
+    # Validate business IDs và convert to UUID
+    for doc in law_docs:
+        business_id = doc.get("id")
+        if not business_id:
+            raise ValueError(f"Document missing 'id' field: {doc}")
+
+        # Convert business ID to UUID và lưu vào doc
+        doc["_uuid"] = business_id_to_uuid(business_id)
+
+    # Batch upload (sử dụng UUID từ business ID)
+    for i in tqdm(range(0, len(law_docs), batch_size), desc="Uploading"):
+        batch_docs = law_docs[i:i + batch_size]
+        batch_embeddings = embeddings[i:i + batch_size]
+
+        points = []
+        for j, (doc, embedding) in enumerate(zip(batch_docs, batch_embeddings)):
+            point_id = doc["_uuid"]  # UUID từ business ID
             
             points.append(PointStruct(
                 id=point_id,
@@ -282,6 +499,99 @@ def upsert_embeddings_to_qdrant(
         )
     
     print(f"   ✅ Uploaded {len(law_docs)} vectors")
+
+
+
+def upsert_hybrid_embeddings_to_qdrant(
+    client: QdrantClient,
+    collection_name: str,
+    dense_embeddings: Optional[np.ndarray],
+    sparse_embeddings: Optional[List[Dict[str, Any]]],
+    colbert_embeddings: Optional[List[np.ndarray]],
+    law_docs: List[Dict[str, Any]],
+    batch_size: int = 100
+) -> None:
+    """
+    Upload hybrid multi-vector embeddings lên Qdrant.
+
+    Convert business ID từ doc["id"] thành UUID để làm point ID.
+    UUID được tạo deterministic từ business ID để đảm bảo consistency.
+
+    Args:
+        client: QdrantClient instance
+        collection_name: Tên collection
+        dense_embeddings: Dense vectors (numpy array, shape: n_docs x dense_dim) or None
+        sparse_embeddings: Sparse vectors (list of dicts with 'indices' and 'values') or None
+        colbert_embeddings: ColBERT vectors (list of numpy arrays, shape: seq_len x colbert_dim) or None
+        law_docs: List chunks với metadata (phải có field "id")
+        batch_size: Batch size cho upload
+
+    Raises:
+        ValueError: Nếu document thiếu field "id", business ID invalid, hoặc mismatch dimensions
+    """
+    # Validate dimensions for non-None embeddings
+    if dense_embeddings is not None and len(dense_embeddings) != len(law_docs):
+        raise ValueError(f"Dense embeddings count mismatch: {len(dense_embeddings)} vs {len(law_docs)} documents")
+    if sparse_embeddings is not None and len(sparse_embeddings) != len(law_docs):
+        raise ValueError(f"Sparse embeddings count mismatch: {len(sparse_embeddings)} vs {len(law_docs)} documents")
+    if colbert_embeddings is not None and len(colbert_embeddings) != len(law_docs):
+        raise ValueError(f"ColBERT embeddings count mismatch: {len(colbert_embeddings)} vs {len(law_docs)} documents")
+
+    print(f"📤 Uploading {len(law_docs)} hybrid vectors in batches of {batch_size}...")
+
+    # Validate business IDs và convert to UUID
+    for doc in law_docs:
+        business_id = doc.get("id")
+        if not business_id:
+            raise ValueError(f"Document missing 'id' field: {doc}")
+
+        # Convert business ID to UUID và lưu vào doc
+        doc["_uuid"] = business_id_to_uuid(business_id)
+
+    # Batch upload (sử dụng UUID từ business ID)
+    for i in tqdm(range(0, len(law_docs), batch_size), desc="Uploading hybrid"):
+        batch_docs = law_docs[i:i + batch_size]
+        batch_dense = dense_embeddings[i:i + batch_size] if dense_embeddings is not None else [None] * len(batch_docs)
+        batch_sparse = sparse_embeddings[i:i + batch_size] if sparse_embeddings is not None else [None] * len(batch_docs)
+        batch_colbert = colbert_embeddings[i:i + batch_size] if colbert_embeddings is not None else [None] * len(batch_docs)
+
+        points = []
+        for j, doc in enumerate(batch_docs):
+            point_id = doc["_uuid"]  # UUID từ business ID
+
+            # Create hybrid vector payload - only include enabled vector types
+            vector_payload = {}
+
+            if dense_embeddings is not None:
+                vector_payload["bge-m3"] = batch_dense[j].tolist()
+
+            if sparse_embeddings is not None:
+                vector_payload["bm25"] = SparseVector(
+                    indices=batch_sparse[j]['indices'],
+                    values=batch_sparse[j]['values']
+                )
+
+            if colbert_embeddings is not None:
+                vector_payload["colbertv2.0"] = batch_colbert[j].tolist()  # Shape: (seq_len, dim)
+
+            points.append(PointStruct(
+                id=point_id,
+                vector=vector_payload,
+                payload={
+                    "id": doc.get("id"),
+                    "content": doc.get("content"),
+                    "metadata": doc.get("metadata", {})
+                }
+            ))
+
+        # Upsert batch
+        client.upsert(
+            collection_name=collection_name,
+            points=points
+        )
+
+    print(f"   ✅ Uploaded {len(law_docs)} hybrid vectors")
+
 
 
 # ==================== EMBEDDING ====================

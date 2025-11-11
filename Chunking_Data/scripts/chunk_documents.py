@@ -20,11 +20,29 @@ Usage:
 import argparse
 import os
 import json
+
+import sys
+
 from datetime import datetime
 from pathlib import Path
 
 from ..pipeline.chunking_pipeline import ChunkingPipeline, validate_chunks
 from ..storage.json_handler import save_chunks_to_json
+
+from ..evaluation.ai_reviewer import (
+    build_review_payload,
+    call_gemini_review,
+    save_issues_report,
+    print_review_summary
+)
+
+# For .env loading
+try:
+    from dotenv import load_dotenv
+    DOTENV_AVAILABLE = True
+except ImportError:
+    DOTENV_AVAILABLE = False
+
 
 
 def load_file_paths(category: str = None, data_files_dir: str = "data_files"):
@@ -59,20 +77,34 @@ EXAMPLES:
   
   # Chunk file cụ thể
   python -m Chunking_Data.scripts.chunk_documents --file "path/to/law.docx"
+
   
+
+
+
   # Chunk tất cả với validation
   python -m Chunking_Data.scripts.chunk_documents --all --validate
         """
     )
     
     # Input options
+
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument(
         "--category",
+
+    input_group = parser.add_mutually_exclusive_group()
+    input_group.add_argument(
+        "--category",
+        default="BDS",
+
         help="Chunk theo category (BDS, DN, TM, QDS)"
     )
     input_group.add_argument(
         "--file",
+
+        default="law_content/Bất động sản/Luật Kinh Doanh Bất Động Sản/Văn bản pháp luật_/Luật Kinh doanh bất động sản 2023 .docx",
+
         help="Chunk file cụ thể"
     )
     input_group.add_argument(
@@ -84,29 +116,60 @@ EXAMPLES:
     # Metadata options
     parser.add_argument(
         "--law-no",
+
         default="",
         help="Số hiệu luật (default: empty)"
     )
     parser.add_argument(
         "--issued-date",
         default="",
+
+        default="29/2023/QH15",
+        help="Số hiệu luật"
+    )
+    parser.add_argument(
+        "--law-title",
+        default="LUẬT KINH DOANH BẤT ĐỘNG SẢN",
+        help="Tên luật"
+    )
+    parser.add_argument(
+        "--law-id",
+        default="LKBDS2023",
+        help="ID luật (unique identifier)"
+    )
+    parser.add_argument(
+        "--issued-date",
+        default="2023-11-28",
+
         help="Ngày ban hành (YYYY-MM-DD)"
     )
     parser.add_argument(
         "--effective-date",
+
         default="",
+
+        default="2023-11-28",
+
         help="Ngày có hiệu lực (YYYY-MM-DD)"
     )
     parser.add_argument(
         "--signer",
+
         default="",
+
+        default="Chủ tịch Quốc hội - Vương Đình Huệ",
+
         help="Người ký"
     )
     
     # Output options
     parser.add_argument(
         "--output-dir",
+
         default="data",
+
+        default="data/bds",
+
         help="Output directory (default: data)"
     )
     parser.add_argument(
@@ -131,10 +194,57 @@ EXAMPLES:
         help="In log chi tiết"
     )
     
+
     args = parser.parse_args()
     
     print("=" * 80)
     print("✂️  CHUNK DOCUMENTS")
+
+    # AI Review options
+    parser.add_argument(
+        "--AI",
+        action="store_true",
+        help="Bật AI review với Gemini (default: OFF)"
+    )
+    parser.add_argument(
+        "--api-key",
+        help="Gemini API key (hoặc set GEMINI_API_KEY env var)"
+    )
+    parser.add_argument(
+        "--sample-excerpts",
+        type=int,
+        default=2000,
+        help="Tổng ký tự excerpts cho AI review (default: 2000)"
+    )
+    parser.add_argument(
+        "--max-chunks-sample",
+        type=int,
+        default=50,
+        help="Số chunks tối đa gửi AI review (default: 50)"
+    )
+    parser.add_argument(
+        "--max-files-sample",
+        type=int,
+        default=2,
+        help="Số files tối đa lấy raw text cho AI review (default: 2)"
+    )
+    parser.add_argument(
+        "--strict-ok-only",
+        action="store_true",
+        help="Chỉ lưu chunks nếu AI confirm OK (chỉ khi --AI)"
+    )
+    
+    args = parser.parse_args()
+    
+    # Load .env if available
+    if DOTENV_AVAILABLE:
+        load_dotenv()
+    
+    print("=" * 80)
+    print("✂️  CHUNK DOCUMENTS")
+    if args.AI:
+        print("🤖 WITH AI REVIEW ENABLED")
+
     print("=" * 80)
     
     # Determine input files
@@ -164,10 +274,38 @@ EXAMPLES:
     
     print(f"📁 Files to process: {len(file_paths)}")
     print(f"📂 Output directory: {args.output_dir}")
+
+
+    # Show metadata info
+    if args.law_title or args.law_no or args.law_id:
+        print(f"📋 Metadata:")
+        if args.law_title:
+            print(f"   - Law Title: {args.law_title}")
+        if args.law_no:
+            print(f"   - Law No: {args.law_no}")
+        if args.law_id:
+            print(f"   - Law ID: {args.law_id}")
+        if args.issued_date:
+            print(f"   - Issued Date: {args.issued_date}")
+        if args.effective_date:
+            print(f"   - Effective Date: {args.effective_date}")
+        if args.signer:
+            print(f"   - Signer: {args.signer}")
+>>>>>>> 985580bf68add13b2bc7f26f77585e9417bff953
     
     if args.dry_run:
         print(f"🔍 DRY RUN MODE - No files will be written")
     
+
+    if args.AI:
+        print(f"🤖 AI Review:")
+        print(f"   - Max files sample: {args.max_files_sample}")
+        print(f"   - Max chunks sample: {args.max_chunks_sample}")
+        print(f"   - Sample excerpts: {args.sample_excerpts} chars")
+        if args.strict_ok_only:
+            print(f"   - Strict OK only: ENABLED")
+    
+
     print("=" * 80)
     
     # Create pipeline
@@ -177,6 +315,9 @@ EXAMPLES:
     chunks, summary = pipeline.process_files(
         file_paths=file_paths,
         default_law_no=args.law_no,
+
+        default_law_title=args.law_title,
+        default_law_id=args.law_id,
         default_issued_date=args.issued_date,
         default_effective_date=args.effective_date,
         default_signer=args.signer
@@ -194,6 +335,104 @@ EXAMPLES:
         else:
             print(f"\n✅ All {validation['valid_chunks']} chunks are valid!")
     
+
+    # AI Review if requested
+    ai_review_passed = True
+    if args.AI:
+        print(f"\n{'='*80}")
+        print(f"🤖 AI REVIEW")
+        print(f"{'='*80}")
+        
+        # Collect raw texts for AI review
+        raw_texts = []
+        if args.max_files_sample > 0:
+            print(f"📖 Collecting raw texts for AI review (max {args.max_files_sample} files)...")
+            files_sampled = 0
+            
+            for file_info in file_paths:
+                if files_sampled >= args.max_files_sample:
+                    break
+                
+                file_path = file_info['path']
+                if os.path.exists(file_path):
+                    try:
+                        from ..core.docx_reader import read_docx
+                        raw_text = read_docx(file_path)
+                        if raw_text and len(raw_text.strip()) > 100:
+                            # Limit to 5k chars per file
+                            raw_texts.append(raw_text[:5000])
+                            files_sampled += 1
+                            if args.verbose:
+                                print(f"   ✅ Sampled file {files_sampled}: {file_info['file_name']} ({len(raw_text)} chars)")
+                    except Exception as e:
+                        if args.verbose:
+                            print(f"   ⚠️  Failed to read {file_info['file_name']}: {e}")
+                        continue
+            
+            print(f"   ✅ Collected excerpts from {len(raw_texts)} files (total ~{sum(len(t) for t in raw_texts)} chars)")
+        
+        # Build review payload
+        print(f"🔨 Building AI review payload...")
+        payload = build_review_payload(
+            chunks=chunks,
+            summary=summary,
+            raw_texts=raw_texts,
+            sample_excerpts_chars=args.sample_excerpts,
+            max_chunks_sample=args.max_chunks_sample
+        )
+        
+        print(f"📤 Calling Gemini AI for review...")
+        print(f"   Sending: {len(payload['chunks_preview'])} sampled chunks + {len(raw_texts)} file excerpts")
+        print(f"   Payload size: ~{len(str(payload)) // 1000}KB")
+        
+        try:
+            review = call_gemini_review(payload, args.api_key)
+            
+            # Print review summary
+            print_review_summary(review, verbose=args.verbose)
+            
+            # Check if passed
+            status = review.get("status", "issues_found")
+            issues = review.get("issues", [])
+            
+            if status != "ok" or issues:
+                ai_review_passed = False
+                
+                # Generate issues filename
+                timestamp = datetime.now().strftime("%H%M%S_%d%m%y")
+                issues_filename = f"{output_prefix}_chunk_{timestamp}.issues.json"
+                
+                if args.category and not args.file:
+                    issues_dir = os.path.join(args.output_dir, args.category)
+                else:
+                    issues_dir = args.output_dir
+                
+                os.makedirs(issues_dir, exist_ok=True)
+                issues_path = os.path.join(issues_dir, issues_filename)
+                
+                # Save issues report
+                save_issues_report(review, issues_path)
+                print(f"💾 Issues report saved: {issues_path}")
+                
+                if args.strict_ok_only:
+                    print(f"\n❌ AI Review FAILED - --strict-ok-only enabled, not saving chunks!")
+                    return
+            else:
+                print(f"✅ AI Review PASSED!")
+                
+        except Exception as e:
+            print(f"❌ AI Review ERROR: {e}")
+            if args.verbose:
+                import traceback
+                traceback.print_exc()
+            
+            if args.strict_ok_only:
+                print(f"\n❌ --strict-ok-only enabled, cannot proceed without AI review!")
+                return
+            else:
+                print(f"⚠️  Proceeding without AI confirmation...")
+    
+
     if args.dry_run:
         print(f"\n🔍 DRY RUN: Would save {len(chunks)} chunks")
         return
@@ -235,4 +474,3 @@ EXAMPLES:
 
 if __name__ == "__main__":
     main()
-

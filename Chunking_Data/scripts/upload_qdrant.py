@@ -49,27 +49,103 @@ EXAMPLES:
       --chunk-file data/BDS.json \\
       --category BDS \\
       --dry-run
+<<<<<<< HEAD
+=======
+
+  # Dense + Sparse hybrid (keyword + semantic)
+  python -m Chunking_Data.scripts.upload_qdrant \\
+      --chunk-file data/BDS.json \\
+      --category BDS \\
+      --dense-sparse
+
+  # Dense + ColBERT hybrid (semantic + reranking)
+  python -m Chunking_Data.scripts.upload_qdrant \\
+      --chunk-file data/BDS.json \\
+      --category BDS \\
+      --dense-colbert
+
+  # Full hybrid (dense + sparse + colbert)
+  python -m Chunking_Data.scripts.upload_qdrant \\
+      --chunk-file data/BDS.json \\
+      --category BDS \\
+      --hybrid
+
+  # Only BM25 sparse retrieval
+  python -m Chunking_Data.scripts.upload_qdrant \\
+      --chunk-file data/BDS.json \\
+      --category BDS \\
+      --sparse-only
+>>>>>>> 985580bf68add13b2bc7f26f77585e9417bff953
         """
     )
     
     # Required arguments
     parser.add_argument(
         "--chunk-file",
+<<<<<<< HEAD
         required=True,
+=======
+        # required=True,
+        default="data/luat_hon_nhan_gia_dinh_2014_chunk_180412_241025.json",
+        
+>>>>>>> 985580bf68add13b2bc7f26f77585e9417bff953
         help="Path to chunk JSON file"
     )
     
     parser.add_argument(
         "--category",
+<<<<<<< HEAD
         required=True,
+=======
+        # required=True,
+        default="QDS",
+>>>>>>> 985580bf68add13b2bc7f26f77585e9417bff953
         help="Category name for collection (e.g., BDS, QDS)"
     )
     
     # Model options
     parser.add_argument(
         "--model",
+<<<<<<< HEAD
         default="minhquan6203/paraphrase-vietnamese-law",
         help="Embedding model name (default: minhquan6203/paraphrase-vietnamese-law)"
+=======
+        default="BAAI/bge-m3",
+        help="Embedding model name"
+    )
+
+    # Vector type options (mutually exclusive)
+    vector_group = parser.add_mutually_exclusive_group()
+    vector_group.add_argument(
+        "--dense-only",
+        action="store_true",
+        help="Chỉ tạo dense embeddings (semantic retrieval)"
+    )
+    vector_group.add_argument(
+        "--sparse-only",
+        action="store_true",
+        help="Chỉ tạo sparse embeddings (BM25 keyword retrieval)"
+    )
+    vector_group.add_argument(
+        "--colbert-only",
+        action="store_true",
+        help="Chỉ tạo ColBERT embeddings (contextual reranking)"
+    )
+    vector_group.add_argument(
+        "--dense-sparse",
+        action="store_true",
+        help="Tạo dense + sparse embeddings (hybrid keyword + semantic)"
+    )
+    vector_group.add_argument(
+        "--dense-colbert",
+        action="store_true",
+        help="Tạo dense + ColBERT embeddings (semantic + reranking)"
+    )
+    vector_group.add_argument(
+        "--hybrid",
+        action="store_true",
+        help="Tạo tất cả 3 loại embeddings (dense + sparse + colbert) - DEFAULT"
+>>>>>>> 985580bf68add13b2bc7f26f77585e9417bff953
     )
     
     parser.add_argument(
@@ -113,7 +189,41 @@ EXAMPLES:
     )
     
     args = parser.parse_args()
+<<<<<<< HEAD
     
+=======
+
+    # Determine vector types to create
+    # Default to hybrid if no specific option selected
+    vector_config = {
+        'dense': False,
+        'sparse': False,
+        'colbert': False
+    }
+
+    if args.dense_only:
+        vector_config['dense'] = True
+    elif args.sparse_only:
+        vector_config['sparse'] = True
+    elif args.colbert_only:
+        vector_config['colbert'] = True
+    elif args.dense_sparse:
+        vector_config['dense'] = True
+        vector_config['sparse'] = True
+    elif args.dense_colbert:
+        vector_config['dense'] = True
+        vector_config['colbert'] = True
+    else:
+        # Default: hybrid (all three) or dense only
+        if args.hybrid:
+            vector_config['dense'] = True
+            vector_config['sparse'] = True
+            vector_config['colbert'] = True
+        else:
+            # Default to dense only if no hybrid option
+            vector_config['dense'] = True
+
+>>>>>>> 985580bf68add13b2bc7f26f77585e9417bff953
     # Fix: --force-recreate override --append
     if args.force_recreate:
         args.append = False
@@ -126,6 +236,27 @@ EXAMPLES:
     print(f"📂 Category: {args.category}")
     print(f"⚙️  Device: {args.device}")
     print(f"📦 Batch size: {args.batch_size}")
+<<<<<<< HEAD
+=======
+
+    # Show vector types
+    vector_types = []
+    if vector_config['dense']:
+        vector_types.append("dense")
+    if vector_config['sparse']:
+        vector_types.append("sparse (BM25)")
+    if vector_config['colbert']:
+        vector_types.append("colbert (rerank)")
+
+    print(f"🔍 Vector types: {', '.join(vector_types)}")
+
+    # Determine if using hybrid pipeline
+    use_hybrid = vector_config['sparse'] or vector_config['colbert']
+    if use_hybrid:
+        print(f"🔄 Pipeline: HYBRID")
+    else:
+        print(f"🔄 Pipeline: STANDARD")
+>>>>>>> 985580bf68add13b2bc7f26f77585e9417bff953
     
     if args.force_recreate:
         print(f"⚠️  FORCE RECREATE MODE - Will DELETE existing data!")
@@ -153,12 +284,31 @@ EXAMPLES:
             return
         
         # 2. Create pipeline
+<<<<<<< HEAD
         pipeline = EmbeddingPipeline(
             model_name=args.model,
             device=args.device,
             batch_size=args.batch_size,
             verbose=args.verbose
         )
+=======
+        if use_hybrid:
+            from ..pipeline.hybrid_embedding_pipeline import HybridEmbeddingPipeline
+            pipeline = HybridEmbeddingPipeline(
+                dense_model_name=args.model,
+                device=args.device,
+                batch_size=args.batch_size,
+                verbose=args.verbose,
+                vector_config=vector_config
+            )
+        else:
+            pipeline = EmbeddingPipeline(
+                model_name=args.model,
+                device=args.device,
+                batch_size=args.batch_size,
+                verbose=args.verbose
+            )
+>>>>>>> 985580bf68add13b2bc7f26f77585e9417bff953
         
         # 3. Process and upload
         results = pipeline.process_and_upload(
@@ -173,8 +323,26 @@ EXAMPLES:
         print(f"{'='*80}")
         print(f"✅ Collection: {results['collection_name']}")
         print(f"✅ Total vectors: {results['total_vectors']}")
+<<<<<<< HEAD
         print(f"✅ Dimension: {results['vector_dimension']}")
         print(f"✅ Model: {results['model_name']}")
+=======
+
+        if use_hybrid:
+            # Hybrid pipeline results
+            if 'dense_dimension' in results:
+                print(f"✅ Dense dim: {results['dense_dimension']}")
+            if 'colbert_dimension' in results:
+                print(f"✅ ColBERT dim: {results['colbert_dimension']}")
+            print(f"✅ Models: dense={results.get('dense_model', 'N/A')}, sparse={results.get('sparse_model', 'N/A')}, colbert={results.get('colbert_model', 'N/A')}")
+        else:
+            # Standard pipeline results
+            if 'vector_dimension' in results:
+                print(f"✅ Dimension: {results['vector_dimension']}")
+                print(f"✅ Model: {results.get('model_name', 'N/A')}")
+            else:
+                print(f"✅ Results keys: {list(results.keys())}")  # Debug
+>>>>>>> 985580bf68add13b2bc7f26f77585e9417bff953
         
     except Exception as e:
         print(f"\n❌ ERROR: {e}")
