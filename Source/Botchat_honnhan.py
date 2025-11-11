@@ -16,9 +16,7 @@ from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 from qdrant_client.http.models import Filter, FieldCondition, MatchValue
 from tenacity import retry, stop_after_attempt, wait_exponential
-from rank_bm25 import BM25Okapi
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-import torch
+
 # ================== CẤU HÌNH MÔI TRƯỜNG ==================
 load_dotenv()
 QDRANT_URL = os.getenv("QDRANT_URL", "").strip()
@@ -26,7 +24,7 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "").strip()
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL_ID = os.getenv("GEMINI_MODEL_ID", "gemini-2.5-flash")
+GEMINI_MODEL_ID = os.getenv("GEMINI_MODEL_ID", "gemini-1.5-flash") # Đã đổi sang 1.5 flash
 INTENT_DEBUG = os.getenv("INTENT_DEBUG", "0").strip() in {"1", "true", "TRUE", "yes", "on"}
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 CASUAL_MAX_WORDS = int(os.getenv("CASUAL_MAX_WORDS", "0").strip() or 0)  # 0 = không giới hạn
@@ -36,55 +34,31 @@ INTENT_FALLBACK_CASUAL = os.getenv(
 "Chào bạn, mình có thể hỗ trợ câu hỏi về Luật Hôn nhân & Gia đình. Bạn muốn hỏi nội dung gì?",
 ).strip()
 
-# INTENT_DEBUG = os.getenv("INTENT_DEBUG", "0").strip() in {"1", "true", "TRUE", "yes", "on"}
-# LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-# CASUAL_MAX_WORDS = int(os.getenv("CASUAL_MAX_WORDS", "0").strip() or 0)
-# INTENT_RAW_PREVIEW_LIMIT = int(os.getenv("INTENT_RAW_PREVIEW_LIMIT", "240").strip() or 240)
-# INTENT_FALLBACK_CASUAL = os.getenv(
-    "INTENT_FALLBACK_CASUAL",
-    "Chào bạn, mình có thể hỗ trợ câu hỏi về Luật Hôn nhân & Gia đình. Bạn muốn hỏi nội dung gì?",
-# ).strip()
-
 if not (QDRANT_URL and QDRANT_API_KEY):
     raise RuntimeError("Thiếu QDRANT_URL hoặc QDRANT_API_KEY trong tệp .env")
 
-# Load BAAI reranker (nên load global)
-# rerank_tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-reranker-base")
-# rerank_model = AutoModelForSequenceClassification.from_pretrained("BAAI/bge-reranker-base")
-# rerank_model.eval()
-
-def rerank_with_baai(query, docs, top_k=15):
-    if not docs:
-        return docs
-
-    pairs = [(query, d["content"]) for d in docs]
-    inputs = rerank_tokenizer(
-        [p[0] for p in pairs],
-        [p[1] for p in pairs],
-        padding=True,
-        truncation=True,
-        return_tensors="pt",
-        max_length=512
-    )
-
-    with torch.no_grad():
-        scores = rerank_model(**inputs).logits.view(-1).float()
-
-    # Gắn lại score vào docs
-    for d, s in zip(docs, scores):
-        d["baai_score"] = float(s)
-
-    reranked = sorted(docs, key=lambda x: x["baai_score"], reverse=True)
-    return reranked[:top_k]
-
 # ================== THIẾT LẬP LOGGING ==================
+
+# SỬA LỖI: Thêm định nghĩa KVFormatter
+class KVFormatter(logging.Formatter):
+    """Formatter để thêm các cặp key=value từ record.extra"""
+    def format(self, record):
+        # Format a base message
+        msg = super().format(record)
+        # Check if there's a __kv__ extra
+        if hasattr(record, "__kv__") and record.__kv__:
+            kv_pairs = " ".join(f"{k}={v}" for k, v in record.__kv__.items())
+            # Thêm vào cuối message, phân tách bằng |
+            msg = f"{msg} | {kv_pairs}"
+        return msg
+
 LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 handlers = [
     logging.StreamHandler(),
     logging.FileHandler("botchat_honnhan.log", encoding="utf-8"),
 ]
 for h in handlers:
-    h.setFormatter(KVFormatter(LOG_FORMAT))
+    h.setFormatter(KVFormatter(LOG_FORMAT)) # Sử dụng KVFormatter
 
 root_logger = logging.getLogger()
 root_logger.handlers = []
@@ -117,7 +91,23 @@ def log_time(func):
                 f"Thời gian thực thi {func.__name__}",
                 extra={"__kv__": {"thoi_gian": f"{elapsed:.4f} giây"}},
             )
-    return sync_wrapper
+    
+    @functools.wraps(func)
+    async def async_wrapper(*args, **kwargs):
+        t0 = time.perf_counter()
+        try:
+            return await func(*args, **kwargs)
+        finally:
+            elapsed = time.perf_counter() - t0
+            app_log.info(
+                f"Thời gian thực thi {func.__name__}",
+                extra={"__kv__": {"thoi_gian": f"{elapsed:.4f} giây"}},
+            )
+            
+    if asyncio.iscoroutinefunction(func):
+        return async_wrapper
+    else:
+        return sync_wrapper
 
 # ================== KHỞI TẠO ==================
 client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=True)
@@ -304,41 +294,7 @@ def analyze_intent(query: str) -> Dict[str, Any]:
         "filters": filters,
     }
 
-def tokenize(text):
-    return re.findall(r'\w+', text.lower())
-
-# Load all documents at startup for global BM25
-def load_all_docs():
-    docs = []
-    offset = None
-    while True:
-        points, next_offset = client.scroll(
-            collection_name=COLLECTION_NAME,
-            limit=100,
-            with_payload=True,
-            offset=offset
-        )
-        for point in points:
-            p = point.payload or {}
-            docs.append({
-                "citation": p.get("exact_citation", ""),
-                "chapter_number": p.get("chapter_number", ""),
-                "article_no": p.get("article_no", ""),
-                "article_title": p.get("article_title", ""),
-                "clause_no": p.get("clause_no", ""),
-                "point_letter": p.get("point_letter", ""),
-                "content": (p.get("content") or "").strip(),
-            })
-        offset = next_offset
-        if offset is None:
-            break
-    return docs
-
-all_docs = load_all_docs()
-tokenized_corpus = [tokenize(d['content']) for d in all_docs]
-bm25_global = BM25Okapi(tokenized_corpus)
-
-# ================== TÌM KIẾM HYBRID ==================
+# ================== TÌM KIẾM VECTOR ==================
 # @log_time
 def _build_filter(query_text: str) -> Optional[Filter]:
     conds: List[FieldCondition] = []
@@ -356,218 +312,80 @@ def _build_filter(query_text: str) -> Optional[Filter]:
         conds.append(FieldCondition(key="chapter_number", match=MatchValue(value=int(m.group(1)))))
     return Filter(must=conds) if conds else None
 
-# @log_time
+@log_time
 async def search_law(query: str, top_k: int = 15, score_threshold: float = 0.42):
+    """Thực hiện vector search (đã loại bỏ BM25 và Reranker)"""
     t0 = time.perf_counter()
     app_log.info(
-        "Bắt đầu tìm kiếm",
+        "Bắt đầu tìm kiếm vector",
         extra={"__kv__": {"cau_hoi": _safe_truncate(query, 80), "top_k": top_k, "nguong_diem": score_threshold}},
     )
 
-    cache_key = f"search|{COLLECTION_NAME}|{top_k}|{score_threshold}|{query}"
+    cache_key = f"search_vector_only|{COLLECTION_NAME}|{top_k}|{score_threshold}|{query}"
     cached = search_cache.get(cache_key)
     if cached is not None:
-        app_log.info("Tìm kiếm từ bộ nhớ cache")
+        app_log.info("Tìm kiếm vector từ bộ nhớ cache")
         return cached
 
     try:
+        # 1. Xây dựng bộ lọc (nếu có)
         flt = _build_filter(query)
-        has_filter = flt is not None and flt.must
+        
+        # 2. Mã hóa câu hỏi
+        t_embed0 = time.perf_counter()
+        vec = encode_query(query)
+        t_embed = time.perf_counter() - t_embed0
 
-        async def bm25_search_task():
-            print(f"DEBUG: Bắt đầu BM25 search task")
-            t_bm250 = time.perf_counter()
-            if flt:
-                print(f"DEBUG: Có filter, fetch filtered docs cho BM25")
-                scroll_res, _ = client.scroll(
-                    collection_name=COLLECTION_NAME,
-                    scroll_filter=flt,
-                    limit=1000,
-                    with_payload=True,
-                )
-                filtered_docs = []
-                for r in scroll_res:
-                    p = r.payload or {}
-                    filtered_docs.append({
-                        "citation": p.get("exact_citation", ""),
-                        "chapter_number": p.get("chapter_number", ""),
-                        "article_no": p.get("article_no", ""),
-                        "article_title": p.get("article_title", ""),
-                        "clause_no": p.get("clause_no", ""),
-                        "point_letter": p.get("point_letter", ""),
-                        "content": (p.get("content") or "").strip(),
-                    })
-                tokenized_filtered = [tokenize(d['content']) for d in filtered_docs]
-                bm25 = BM25Okapi(tokenized_filtered)
-                docs_base = filtered_docs
-            else:
-                print(f"DEBUG: Không filter, dùng BM25 global")
-                bm25 = bm25_global
-                docs_base = all_docs
-
-            tokenized_query = tokenize(query)
-            bm25_scores = bm25.get_scores(tokenized_query)
-            scored_indices = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:20]
-            bm25_docs = []
-            for idx in scored_indices:
-                if bm25_scores[idx] > 0:  # Optional threshold
-                    d = docs_base[idx].copy()
-                    d['bm25_score'] = float(bm25_scores[idx])
-                    bm25_docs.append(d)
-            t_bm25 = time.perf_counter() - t_bm250
-            print(f"DEBUG: Hoàn tất BM25 search, số docs: {len(bm25_docs)}, thời gian: {t_bm25:.4f}s")
-            print(f"DEBUG: Top 3 BM25 docs scores: {[d['bm25_score'] for d in bm25_docs[:3]] if bm25_docs else []}")
-            return bm25_docs, t_bm25
-
-        async def embedding_search_task():
-            print(f"DEBUG: Bắt đầu embedding search task")
-            t_embed0 = time.perf_counter()
-            vec = encode_query(query)
-            t_embed = time.perf_counter() - t_embed0
-            print(f"DEBUG: Hoàn tất encode query, thời gian: {t_embed:.4f}s")
-
-            print(f"DEBUG: Bắt đầu query Qdrant")
-            t_q0 = time.perf_counter()
-            results = client.query_points(
-                collection_name=COLLECTION_NAME,
-                query=vec,
-                with_payload=True,
-                limit=20,
-                query_filter=flt,
-            )
-            t_qdrant = time.perf_counter() - t_q0
-            print(f"DEBUG: Hoàn tất embedding search, thời gian: {t_qdrant:.4f}s")
-
-            emb_docs = []
-            for r in results.points:
-                p = r.payload or {}
-                emb_docs.append({
-                    "citation": p.get("exact_citation", ""),
-                    "chapter_number": p.get("chapter_number", ""),
-                    "article_no": p.get("article_no", ""),
-                    "article_title": p.get("article_title", ""),
-                    "clause_no": p.get("clause_no", ""),
-                    "point_letter": p.get("point_letter", ""),
-                    "content": (p.get("content") or "").strip(),
-                    "embedding_score": float(r.score or 0.0),
-                })
-            print(f"DEBUG: Số embedding docs: {len(emb_docs)}")
-            print(f"DEBUG: Top 3 embedding scores: {[d['embedding_score'] for d in emb_docs[:3]] if emb_docs else []}")
-            return emb_docs, t_embed, t_qdrant
-
-        # Chạy song song
-        bm25_task = asyncio.create_task(bm25_search_task())
-        embedding_task = asyncio.create_task(embedding_search_task())
-
-        bm25_result = await bm25_task
-        embedding_result = await embedding_task
-
-        bm25_docs, t_bm25 = bm25_result
-        emb_docs, t_embed, t_qdrant = embedding_result
-
-        # Merge and dedup
-        print(f"DEBUG: Bắt đầu merge và dedup từ {len(emb_docs)} emb + {len(bm25_docs)} bm25 docs")
-        all_unique = {}
-        key_func = lambda d: (d.get('article_no', ''), d.get('clause_no', ''), d.get('point_letter', ''))
-        for d in emb_docs:
-            key = key_func(d)
-            if key not in all_unique:
-                all_unique[key] = d.copy()
-            all_unique[key]['embedding_score'] = d['embedding_score']
-            all_unique[key]['bm25_score'] = 0.0  # Default
-
-        for d in bm25_docs:
-            key = key_func(d)
-            if key not in all_unique:
-                all_unique[key] = d.copy()
-            all_unique[key]['bm25_score'] = d['bm25_score']
-            all_unique[key]['embedding_score'] = all_unique[key].get('embedding_score', 0.0)
-
-        merged_docs = list(all_unique.values())
-        print(f"DEBUG: Sau merge, số unique docs: {len(merged_docs)}")
-
-        # Weighted Hybrid Scoring (rerank lần đầu)
-        print(f"DEBUG: Bắt đầu weighted hybrid scoring, alpha={0.7 if has_filter else 0.5}, beta={0.3 if has_filter else 0.5}")
-        t_rerank0 = time.perf_counter()
-        if merged_docs:
-            emb_scores = [d['embedding_score'] for d in merged_docs]
-            bm25_scores = [d['bm25_score'] for d in merged_docs]
-            min_emb, max_emb = min(emb_scores), max(emb_scores) if emb_scores else (0, 0)
-            min_bm25, max_bm25 = min(bm25_scores), max(bm25_scores) if bm25_scores else (0, 0)
-
-            for d in merged_docs:
-                if max_emb > min_emb:
-                    d['norm_emb'] = (d['embedding_score'] - min_emb) / (max_emb - min_emb)
-                else:
-                    d['norm_emb'] = 0.5 if d['embedding_score'] > 0 else 0.0
-                if max_bm25 > min_bm25:
-                    d['norm_bm25'] = (d['bm25_score'] - min_bm25) / (max_bm25 - min_bm25)
-                else:
-                    d['norm_bm25'] = 0.5 if d['bm25_score'] > 0 else 0.0
-
-            # Alpha beta based on query clarity
-            if has_filter:
-                alpha = 0.7  # embedding high for clear query
-                beta = 0.3
-            else:
-                alpha = 0.5
-                beta = 0.5
-
-            for d in merged_docs:
-                d['score'] = alpha * d['norm_emb'] + beta * d['norm_bm25']
-
-            ranked = sorted(merged_docs, key=lambda d: d['score'], reverse=True)
-
-            # Clean extra keys
-            for d in ranked:
-                d.pop('norm_emb', None)
-                d.pop('norm_bm25', None)
-                d.pop('embedding_score', None)
-                d.pop('bm25_score', None)
-
-            # Lấy top 15 sau hybrid rerank và filter threshold
-            selected = [d for d in ranked if d['score'] >= score_threshold][:15]
-        else:
-            selected = []
-        t_rerank = time.perf_counter() - t_rerank0
-        print(f"DEBUG: Hoàn tất weighted hybrid, số selected docs: {len(selected)}, thời gian: {t_rerank:.4f}s")
-
-        # =========================
-        # BAAI Rerank step (rerank lần 2)
-        # =========================
-        t_baai0 = time.perf_counter()
-        if selected:
-            print("DEBUG: Bắt đầu rerank bằng BAAI/bge-reranker-base")
-            # Rerank chỉ top 15 docs, lấy top 7 tốt nhất
-            selected = rerank_with_baai(query, selected, top_k=7)
-            print("DEBUG: Hoàn tất rerank bằng BAAI, top1 score:", selected[0].get("baai_score"))
-        t_baai = time.perf_counter() - t_baai0
-        print(f"DEBUG: Thời gian rerank BAAI: {t_baai:.4f}s")
-        # =========================
-
-        search_cache.set(cache_key, selected)
-
-        sk_top1 = selected[0]['score'] if selected and 'score' in selected[0] else (
-            selected[0].get("baai_score", 0.0) if selected else 0.0
+        # 3. Truy vấn Qdrant
+        t_q0 = time.perf_counter()
+        results = client.query_points(
+            collection_name=COLLECTION_NAME,
+            query=vec,
+            with_payload=True,
+            limit=int(top_k),         # Chỉ lấy top_k
+            query_filter=flt,         # Áp dụng bộ lọc
+            score_threshold=float(score_threshold) # Áp dụng ngưỡng điểm
         )
+        t_qdrant = time.perf_counter() - t_q0
+        
+        # 4. Định dạng kết quả
+        selected_docs = []
+        for r in results.points:
+            p = r.payload or {}
+            selected_docs.append({
+                "source_id": p.get("source_id", ""), # SỬA LỖI: Thêm source_id
+                "citation": p.get("exact_citation", ""),
+                "chapter_number": p.get("chapter_number", ""),
+                "article_no": p.get("article_no", ""),
+                "article_title": p.get("article_title", ""),
+                "clause_no": p.get("clause_no", ""),
+                "point_letter": p.get("point_letter", ""),
+                "content": (p.get("content") or "").strip(),
+                "score": float(r.score or 0.0), # Giữ 'score' để markdown dùng
+            })
+
+        search_cache.set(cache_key, selected_docs)
+        
+        sk_top1 = selected_docs[0]['score'] if selected_docs else 0.0
+        
         log_step(
-            "tim_kiem",
+            "tim_kiem_vector",
             k_yeu_cau=top_k,
-            k_tra_ve=len(selected),
+            k_tra_ve=len(selected_docs),
             diem_top1=f"{sk_top1:.4f}",
             t_nhung=f"{t_embed:.4f}",
             t_qdrant=f"{t_qdrant:.4f}",
-            t_bm25=f"{t_bm25:.4f}",
-            t_rerank=f"{t_rerank:.4f}",
-            t_baai=f"{t_baai:.4f}",
             t_tong=f"{time.perf_counter()-t0:.4f}",
         )
         app_log.info(
-            "Tìm kiếm hoàn tất",
-            extra={"__kv__": {"so_luong": len(selected), "diem_top1": f"{sk_top1:.4f}"}})
-        return bm25_docs, emb_docs, selected
+            "Tìm kiếm vector hoàn tất",
+            extra={"__kv__": {"so_luong": len(selected_docs), "diem_top1": f"{sk_top1:.4f}"}})
+        
+        # Trả về danh sách tài liệu duy nhất
+        return selected_docs
+        
     except Exception as e:
-        app_log.error("Lỗi tìm kiếm", extra={"__kv__": {"loi": str(e)}})
+        app_log.error("Lỗi tìm kiếm vector", extra={"__kv__": {"loi": str(e)}})
         log_step("tim_kiem_loi", thong_bao=str(e))
         raise
 
@@ -598,7 +416,7 @@ def docs_to_markdown(docs: List[Dict[str, Any]]):
         score = round(d.get("score", 0.0), 4)
         sid = d.get("source_id", "")
         lines.append(
-            f"**{i}. [{sid}] {cited}{chapter}{title}**  \n" +
+            f"**{i}. [{sid}] {cited}{chapter}{title}** \n" +
             f"{content}  \n" +
             f"<sub>Độ liên quan: {score}</sub>\n"
         )
@@ -690,20 +508,26 @@ def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None):
     return prompt
 
 # ================== XỬ LÝ TRẢ LỜI LLM ==================
-# @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def _gemini_stream(prompt, temperature: float):
+# SỬA LỖI: Kích hoạt lại @retry
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+async def _gemini_stream_async(prompt, temperature: float):
+    """SỬA LỖI: Chuyển sang phiên bản async"""
     cfg = genai.types.GenerationConfig(temperature=float(temperature))
-    return answer_model.generate_content(prompt, generation_config=cfg, stream=True)
+    # SỬA LỖI: Sử dụng generate_content_async
+    return await answer_model.generate_content_async(prompt, generation_config=cfg, stream=True)
 
-# @log_time
-def stream_answer(prompt, temperature=0.2):
+@log_time
+async def stream_answer(prompt, temperature=0.2):
+    """SỬA LỖI: Chuyển sang async def để dùng 'async for'"""
     t0 = time.perf_counter()
     t_first0 = time.perf_counter()
     first_token_emitted = False
     try:
-        resp = _gemini_stream(prompt, temperature)
-        resp = _gemini_stream(prompt, temperature)
-        for ch in resp:
+        # SỬA LỖI: Xóa cuộc gọi trùng lặp
+        resp = await _gemini_stream_async(prompt, temperature)
+        
+        # SỬA LỖI: Dùng 'async for'
+        async for ch in resp:
             if getattr(ch, "text", None):
                 if not first_token_emitted:
                     log_step("llm_first_token", thoi_gian_truoc=f"{time.perf_counter()-t_first0:.4f}")
@@ -758,6 +582,7 @@ def _fetch(filters: Dict[str, Any], limit: int = 10):
         for r in scroll_res:
             p = r.payload or {}
             out.append({
+                "source_id": p.get("source_id", ""), # SỬA LỖI: Thêm source_id
                 "chapter": p.get("chapter", ""),
                 "article_no": p.get("article_no", ""),
                 "article_title": p.get("article_title", ""),
@@ -779,13 +604,12 @@ def _fetch(filters: Dict[str, Any], limit: int = 10):
     return out
 
 # ================== HÀM HỖ TRỢ GIAO DIỆN ==================
-def ui_return(msg_val, chatbot_val, bm25_val, emb_val, cites_val, last_answer_val, docs_val, page_val, page_label_val, history_msgs):
-    """Helper function đảm bảo luôn trả về đúng 10 giá trị"""
-    print("DEBUG: Gọi hàm ui_return, trả về 10 giá trị")
+def ui_return(msg_val, chatbot_val, emb_val, cites_val, last_answer_val, docs_val, page_val, page_label_val, history_msgs):
+    """Helper function đảm bảo luôn trả về đúng 9 giá trị (đã xóa bm25)"""
+    print("DEBUG: Gọi hàm ui_return, trả về 9 giá trị")
     return (
         msg_val,
         chatbot_val,
-        gr.update(value=bm25_val),
         gr.update(value=emb_val),
         gr.update(value=cites_val),
         last_answer_val,
@@ -800,15 +624,15 @@ CSS = """
 #chatbot { height: 540px !important; }
 label { font-size:12px !important; opacity:.9 }
 #cites-box {
-    max-height: 360px;
+    max-height: 480px; /* Tăng chiều cao */
     overflow-y: auto;
     border: 1px solid #ddd;
     padding: 6px;
     border-radius: 6px;
     background-color: #fafafa;
 }
-#bm25-box, #emb-box {
-    max-height: 200px;
+#emb-box {
+    max-height: 280px; /* Tăng chiều cao */
     overflow-y: auto;
     border: 1px solid #ddd;
     padding: 6px;
@@ -822,7 +646,7 @@ with gr.Blocks(
     css=CSS,
 ) as demo:
     gr.Markdown("""
-    ### ⚖️ Trợ lý Luật Hôn Nhân & Gia đình 2014
+    ### ⚖️ Trợ lý Luật Hôn Nhân & gia đình 2014
     *Tham chiếu chính xác • Hạn chế suy diễn • Không thay thế tư vấn pháp lý*
     """)
 
@@ -840,12 +664,11 @@ with gr.Blocks(
                 ex2 = gr.Button("Điều 81 quy định gì về việc nuôi con sau ly hôn")
                 ex3 = gr.Button("Khoản 2 Điều 56 nói gì")
         with gr.Column(scale=5):
-            gr.Markdown("**📜 Kết quả BM25**")
-            bm25_md = gr.Markdown(value="(Chưa có dữ liệu)", elem_id="bm25-box")
-            
-            gr.Markdown("**📜 Kết quả Embedding Search**")
+            # ĐÃ XÓA PANEL BM25
+            gr.Markdown("**📜 Kết quả tìm kiếm (Vector Search)**")
             emb_md = gr.Markdown(value="(Chưa có dữ liệu)", elem_id="emb-box")
-            gr.Markdown("**Cơ sở pháp lý**")
+            
+            gr.Markdown("**Cơ sở pháp lý (Chi tiết)**")
             cites_md = gr.Markdown(value="(Chưa có dữ liệu)", elem_id="cites-box")
             with gr.Row():
                 prev_page = gr.Button("⬅️")
@@ -876,10 +699,10 @@ with gr.Blocks(
     state_docs = gr.State([])
     state_page = gr.State(1)
 
-    # -------- GENERATOR CHÍNH - Xử lý logic và yield từng chunk --------
+    # -------- GENERATOR CHÍNH - SỬA LỖI: Chuyển sang async def --------
     @log_time
-    def respond_generator(message, history_msgs, cur_page_size, k=15, temperature=0.2, threshold=0.42):
-        """Generator function - yield từng update dần dần (sync wrapper cho async code)"""
+    async def respond_generator(message, history_msgs, cur_page_size, k=15, temperature=0.2, threshold=0.42):
+        """Generator function - yield từng update dần dần (ĐÃ CHUYỂN SANG ASYNC)"""
         print(f"DEBUG: Bắt đầu xử lý câu hỏi: {message}")
         if not (message and message.strip()):
             print("DEBUG: Câu hỏi rỗng, trả về mặc định")
@@ -887,7 +710,7 @@ with gr.Blocks(
             yield ui_return(
                 gr.update(value=""),
                 history_msgs,
-                "",
+                # "", # Bỏ bm25_val
                 "",
                 "",
                 "",
@@ -946,7 +769,6 @@ with gr.Blocks(
                         history_msgs,
                         "(Không có trích dẫn)",
                         "(Không có trích dẫn)",
-                        "(Không có trích dẫn)",
                         final_answer,
                         [],
                         1,
@@ -970,7 +792,6 @@ with gr.Blocks(
                     history_msgs,
                     "(Không có trích dẫn)",
                     "(Không có trích dẫn)",
-                    "(Không có trích dẫn)",
                     acc,
                     [],
                     1,
@@ -978,35 +799,13 @@ with gr.Blocks(
                     history_msgs,
                 )
                 
-                # Stream từng chunk
-                buffer = ""
-                for chunk in stream_answer(simple_prompt, temperature=float(temperature)):
-                    buffer += chunk
-                    if len(buffer) >= 50:  # Tích lũy 50 ký tự mới yield
-                        acc += buffer
-                        history_msgs[-1]["content"] = acc
-                        yield ui_return(
-                            gr.update(value=""),
-                            history_msgs,
-                            "(Không có trích dẫn)",
-                            "(Không có trích dẫn)",
-                            "(Không có trích dẫn)",
-                            acc,
-                            [],
-                            1,
-                            " Trang 0/0",
-                            history_msgs,
-                        )
-                        buffer = ""
-                
-                # Yield phần còn lại
-                if buffer:
-                    acc += buffer
+                # Stream từng chunk - SỬA LỖI: dùng async for và bỏ buffer
+                async for chunk in stream_answer(simple_prompt, temperature=float(temperature)):
+                    acc += chunk
                     history_msgs[-1]["content"] = acc
                     yield ui_return(
                         gr.update(value=""),
                         history_msgs,
-                        "(Không có trích dẫn)",
                         "(Không có trích dẫn)",
                         "(Không có trích dẫn)",
                         acc,
@@ -1015,48 +814,36 @@ with gr.Blocks(
                         " Trang 0/0",
                         history_msgs,
                     )
+
                 print("DEBUG: Hoàn thành stream câu trả lời xã giao")
                 return
 
             # ========== XỬ LÝ CÂU HỎI PHÁP LÝ ==========
             docs: List[Dict[str, Any]] = []
-            bm25_docs: List[Dict[str, Any]] = []
-            emb_docs: List[Dict[str, Any]] = []
             source = None
 
             if intent == "law_search":
                 print("DEBUG: Tìm kiếm điều luật")
                 docs = _fetch(intent_filters, limit=int(k)) if intent_filters else []
-                source = "law_search"
+                source = "law_search_fetch"
                 if not docs:
                     app_log.info(
-                        "Rơi vào tìm kiếm embedding",
+                        "Rơi vào tìm kiếm vector (fallback)",
                         extra={"__kv__": {"cau_hoi": message}},
                     )
-                    # Gọi async function trong sync context - dùng nest_asyncio
-                    try:
-                        loop = asyncio.get_event_loop()
-                    except RuntimeError:
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                    
-                    bm25_docs, emb_docs, docs = loop.run_until_complete(
-                        search_law(message, top_k=int(k), score_threshold=float(threshold))
+                    # SỬA LỖI: Dùng await trực tiếp
+                    docs = await search_law(
+                        message, top_k=int(k), score_threshold=float(threshold)
                     )
-                    source = "law_search_embedding_fallback"
+                    source = "law_search_vector_fallback"
 
             elif intent == "legal_answer":
-                print("DEBUG: Tìm kiếm câu trả lời pháp lý")
-                # Gọi async function trong sync context
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    bm25_docs, emb_docs, docs = loop.run_until_complete(
-                        search_law(normalized_query, top_k=int(k), score_threshold=float(threshold))
-                    )
-                finally:
-                    loop.close()
-                source = "legal_answer"
+                print("DEBUG: Tìm kiếm câu trả lời pháp lý (vector search)")
+                # SỬA LỖI: Dùng await trực tiếp
+                docs = await search_law(
+                    normalized_query, top_k=int(k), score_threshold=float(threshold)
+                )
+                source = "legal_answer_vector"
 
             else:
                 reply = INTENT_FALLBACK_CASUAL
@@ -1068,7 +855,6 @@ with gr.Blocks(
                 yield ui_return(
                     gr.update(value=""),
                     history_msgs,
-                    "(Không có trích dẫn)",
                     "(Không có trích dẫn)",
                     "(Không có trích dẫn)",
                     reply,
@@ -1094,7 +880,6 @@ with gr.Blocks(
                     upd,
                     "(Chưa có dữ liệu)",
                     "(Chưa có dữ liệu)",
-                    "(Chưa có dữ liệu)",
                     reply,
                     [],
                     1,
@@ -1110,9 +895,9 @@ with gr.Blocks(
                 user_query = message
             else:
                 user_query = message
-                
-            bm25_markdown = docs_to_markdown(bm25_docs)
-            emb_markdown = docs_to_markdown(emb_docs)
+            
+            # ĐÃ XÓA bm25_markdown
+            emb_markdown = docs_to_markdown(docs) # emb_md giờ là docs chính
             cites_markdown, page_label = docs_page_markdown(docs, 1, int(cur_page_size))
             prompt = build_prompt(user_query, docs, history_msgs)
 
@@ -1132,8 +917,7 @@ with gr.Blocks(
             yield ui_return(
                 gr.update(value=""),
                 history_msgs,
-                bm25_markdown,
-                emb_markdown,
+                emb_markdown, # Hiển thị docs lên panel emb
                 cites_markdown,
                 acc,
                 docs,
@@ -1142,35 +926,13 @@ with gr.Blocks(
                 history_msgs,
             )
             
-            # Stream từng chunk
-            buffer = ""
-            for chunk in stream_answer(prompt, temperature=float(temperature)):
-                buffer += chunk
-                if len(buffer) >= 50:  # Tích lũy 50 ký tự mới yield
-                    acc += buffer
-                    history_msgs[-1]["content"] = acc
-                    yield ui_return(
-                        gr.update(value=""),
-                        history_msgs,
-                        bm25_markdown,
-                        emb_markdown,
-                        cites_markdown,
-                        acc,
-                        docs,
-                        1,
-                        page_label,
-                        history_msgs,
-                    )
-                    buffer = ""
-            
-            # Yield phần còn lại
-            if buffer:
-                acc += buffer
+            # Stream từng chunk - SỬA LỖI: dùng async for và bỏ buffer
+            async for chunk in stream_answer(prompt, temperature=float(temperature)):
+                acc += chunk
                 history_msgs[-1]["content"] = acc
                 yield ui_return(
                     gr.update(value=""),
                     history_msgs,
-                    bm25_markdown,
                     emb_markdown,
                     cites_markdown,
                     acc,
@@ -1179,6 +941,7 @@ with gr.Blocks(
                     page_label,
                     history_msgs,
                 )
+
             print("DEBUG: Hoàn thành stream câu trả lời pháp lý")
             return
 
@@ -1190,7 +953,6 @@ with gr.Blocks(
                 history_msgs,
                 "(Lỗi hệ thống)",
                 "(Lỗi hệ thống)",
-                "(Lỗi hệ thống)",
                 f"Lỗi: {e}",
                 [],
                 1,
@@ -1199,31 +961,44 @@ with gr.Blocks(
             )
             return
 
-    # -------- WRAPPER ĐỒNG BỘ - Gradio gọi hàm này --------
-    def respond_wrapper(message, history_msgs, cur_page_size, k=15, temperature=0.2, threshold=0.42):
-        """Wrapper để Gradio gọi - chuyển tiếp từ generator"""
-        for output in respond_generator(message, history_msgs, cur_page_size, k, temperature, threshold):
+    # -------- WRAPPER BẤT ĐỒNG BỘ - Gradio gọi hàm này --------
+    async def respond_wrapper(message, history_msgs, cur_page_size, k=15, temperature=0.2, threshold=0.42):
+        """SỬA LỖI: Wrapper async để Gradio gọi"""
+        async for output in respond_generator(message, history_msgs, cur_page_size, k, temperature, threshold):
             yield output
 
-    # Kết nối outputs (10 giá trị)
+    # Kết nối outputs (9 giá trị, đã xóa bm25_md)
     outputs = [
         msg,                  # 1
         chatbot,              # 2
-        bm25_md,              # 3
-        emb_md,               # 4
-        cites_md,             # 5
-        state_last_answer,    # 6
-        state_docs,           # 7
-        state_page,           # 8
-        page_info,            # 9
-        state_history,        # 10
+        emb_md,               # 3
+        cites_md,             # 4
+        state_last_answer,    # 5
+        state_docs,           # 6
+        state_page,           # 7
+        page_info,            # 8
+        state_history,        # 9
     ]
     
     # Kết nối với wrapper (BẬT queue=True để hỗ trợ streaming)
     send.click(respond_wrapper, inputs=[msg, state_history, page_size], outputs=outputs, queue=True)
     msg.submit(respond_wrapper, inputs=[msg, state_history, page_size], outputs=outputs, queue=True)
 
-    # Like/Dislike
+    # Nút Làm mới
+    def clear_all():
+        return (
+            "",                     # msg
+            [],                     # chatbot
+            "(Chưa có dữ liệu)",    # emb_md
+            "(Chưa có dữ liệu)",    # cites_md
+            "",                     # state_last_answer
+            [],                     # state_docs
+            1,                      # state_page
+            " Trang 0/0",           # page_info
+            []                      # state_history
+        )
+    clear.click(clear_all, outputs=outputs, queue=False)
+
     # Like/Dislike
     def on_like(data: gr.LikeData):
         msg_like = data.value or {}
@@ -1267,4 +1042,5 @@ with gr.Blocks(
 
 if __name__ == "__main__":
     demo.queue()
-    demo.launch(show_error=True, share=True)
+    # Bạn có thể chạy demo.launch() với share=True nếu cần
+    demo.launch(show_error=True)
