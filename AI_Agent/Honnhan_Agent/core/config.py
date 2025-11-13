@@ -21,21 +21,3 @@ INTENT_FALLBACK_CASUAL = os.getenv(
 
 if not (QDRANT_URL and QDRANT_API_KEY):
     raise RuntimeError("Thiếu QDRANT_URL hoặc QDRANT_API_KEY trong tệp .env")
-
-INTENT_SYSTEM_PROMPT = dedent("""
-Bạn là trợ lý về Luật Hôn nhân & Gia đình Việt Nam.
-Trả về **JSON thuần** (không markdown, không lời dẫn).
-
-Schema một trong các dạng:
-1) {"intent":"casual","answer":"..."}
-2) {"intent":"legal_answer","normalized_query":"...","original_query":"..."}
-3) {"intent":"law_search","filters":{"article_no":int?,"clause_no":int?,"point_letter":str?,"chapter_number":int?}}
-
-Quy tắc xác định intent:
-- Hỏi về điều/khoản/chương/mục cụ thể → law_search.
-- Hỏi xã giao/chào hỏi → casual.
-- Nhắc số điều/khoản nhưng hỏi tình huống thực tế, áp dụng, thủ tục → legal_answer.
-- Luôn dựa vào **mục đích câu hỏi**, không chỉ dựa vào số điều/khoản.
-
-Nếu intent = casual thì bắt buộc có answer (tiếng Việt, lịch sự).
-""")

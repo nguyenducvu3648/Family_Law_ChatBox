@@ -12,6 +12,7 @@ from services.prompt import build_prompt
 from agents.llm import stream_answer
 from retrieval.fetch import _fetch
 from core.config import INTENT_FALLBACK_CASUAL, CASUAL_MAX_WORDS
+from agents.query_rewriter import rewrite_query
 
 CSS = """
 #chatbot { height: 540px !important; }
@@ -82,6 +83,8 @@ def respond_generator(message, history_msgs, cur_page_size, k=15, temperature=0.
         normalized_query = intent_info.get("normalized_query", message)
         original_query = intent_info.get("original_query", message)
         intent_filters = intent_info.get("filters", {})
+        query_type = intent_info.get("query_type", "")  # NEW: lấy query_type
+        use_fetch = intent_info.get("use_fetch", False)  # NEW: lấy use_fetch
 
         # ========== XỬ LÝ CÂU HỎI XÃ GIAO ==========
         if intent == "casual":
@@ -198,15 +201,35 @@ def respond_generator(message, history_msgs, cur_page_size, k=15, temperature=0.
         source = None
 
         if intent == "law_search":
-            print("DEBUG: Tìm kiếm điều luật")
-            docs = _fetch(intent_filters, limit=int(k)) if intent_filters else []
-            source = "law_search"
-            if not docs:
+            print(f"DEBUG: Law search với query_type={query_type}, use_fetch={use_fetch}")
+            
+            # ========== LOGIC MỚI: FETCH vs RAG ==========
+            if use_fetch:
+                # CÓ FILTERS → Dùng FETCH (nhanh, chính xác)
                 app_log.info(
-                    "Rơi vào tìm kiếm embedding",
-                    extra={"__kv__": {"cau_hoi": message}},
+                    "🎯 LAW_SEARCH: Sử dụng FETCH",
+                    extra={"__kv__": {
+                        "query_type": query_type,
+                        "filters": str(intent_filters),
+                        "method": "fetch"
+                    }}
                 )
-                # Gọi async function trong sync context - dùng nest_asyncio
+                log_step("law_search_method", method="fetch", query_type=query_type, has_filters=True)
+                docs = _fetch(intent_filters, limit=int(k))
+                source = "law_search_fetch"
+            else:
+                # KHÔNG CÓ FILTERS → Dùng RAG (compare, definition)
+                app_log.info(
+                    "🔍 LAW_SEARCH: Sử dụng RAG",
+                    extra={"__kv__": {
+                        "query": message[:80],
+                        "query_type": query_type,
+                        "method": "rag_search"
+                    }}
+                )
+                log_step("law_search_method", method="rag_search", query_type=query_type, has_filters=False)
+                
+                # Gọi RAG search_law
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
@@ -215,10 +238,31 @@ def respond_generator(message, history_msgs, cur_page_size, k=15, temperature=0.
                     )
                 finally:
                     loop.close()
-                source = "law_search_embedding_fallback"
+                source = f"law_search_rag_{query_type}"
+            
+            # Fallback nếu không tìm thấy gì (chỉ khi dùng fetch)
+            if not docs and use_fetch:
+                app_log.info(
+                    "Không tìm thấy docs từ fetch, fallback sang embedding search",
+                    extra={"__kv__": {"cau_hoi": message}}
+                )
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    bm25_docs, emb_docs, docs = loop.run_until_complete(
+                        search_law(message, top_k=int(k), score_threshold=float(threshold))
+                    )
+                finally:
+                    loop.close()
+                source = "law_search_fallback"
 
         elif intent == "legal_answer":
             print("DEBUG: Tìm kiếm câu trả lời pháp lý")
+            # Re-rewrite normalized_query to be search/RAG-friendly
+            try:
+                normalized_query = rewrite_query(normalized_query)
+            except Exception:
+                pass
             # Gọi async function trong sync context
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)

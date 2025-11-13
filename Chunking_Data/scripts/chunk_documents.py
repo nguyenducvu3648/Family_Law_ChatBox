@@ -20,12 +20,15 @@ Usage:
 import argparse
 import os
 import json
+
 import sys
+
 from datetime import datetime
 from pathlib import Path
 
 from ..pipeline.chunking_pipeline import ChunkingPipeline, validate_chunks
 from ..storage.json_handler import save_chunks_to_json
+
 from ..evaluation.ai_reviewer import (
     build_review_payload,
     call_gemini_review,
@@ -39,6 +42,7 @@ try:
     DOTENV_AVAILABLE = True
 except ImportError:
     DOTENV_AVAILABLE = False
+
 
 
 def load_file_paths(category: str = None, data_files_dir: str = "data_files"):
@@ -74,21 +78,33 @@ EXAMPLES:
   # Chunk file cụ thể
   python -m Chunking_Data.scripts.chunk_documents --file "path/to/law.docx"
 
+  
+
+
+
   # Chunk tất cả với validation
   python -m Chunking_Data.scripts.chunk_documents --all --validate
         """
     )
     
     # Input options
+
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
+        "--category",
+
     input_group = parser.add_mutually_exclusive_group()
     input_group.add_argument(
         "--category",
         default="BDS",
+
         help="Chunk theo category (BDS, DN, TM, QDS)"
     )
     input_group.add_argument(
         "--file",
+
         default="law_content/Bất động sản/Luật Kinh Doanh Bất Động Sản/Văn bản pháp luật_/Luật Kinh doanh bất động sản 2023 .docx",
+
         help="Chunk file cụ thể"
     )
     input_group.add_argument(
@@ -100,6 +116,14 @@ EXAMPLES:
     # Metadata options
     parser.add_argument(
         "--law-no",
+
+        default="",
+        help="Số hiệu luật (default: empty)"
+    )
+    parser.add_argument(
+        "--issued-date",
+        default="",
+
         default="29/2023/QH15",
         help="Số hiệu luật"
     )
@@ -116,23 +140,36 @@ EXAMPLES:
     parser.add_argument(
         "--issued-date",
         default="2023-11-28",
+
         help="Ngày ban hành (YYYY-MM-DD)"
     )
     parser.add_argument(
         "--effective-date",
+
+        default="",
+
         default="2023-11-28",
+
         help="Ngày có hiệu lực (YYYY-MM-DD)"
     )
     parser.add_argument(
         "--signer",
+
+        default="",
+
         default="Chủ tịch Quốc hội - Vương Đình Huệ",
+
         help="Người ký"
     )
     
     # Output options
     parser.add_argument(
         "--output-dir",
+
+        default="data",
+
         default="data/bds",
+
         help="Output directory (default: data)"
     )
     parser.add_argument(
@@ -157,6 +194,12 @@ EXAMPLES:
         help="In log chi tiết"
     )
     
+
+    args = parser.parse_args()
+    
+    print("=" * 80)
+    print("✂️  CHUNK DOCUMENTS")
+
     # AI Review options
     parser.add_argument(
         "--AI",
@@ -201,6 +244,7 @@ EXAMPLES:
     print("✂️  CHUNK DOCUMENTS")
     if args.AI:
         print("🤖 WITH AI REVIEW ENABLED")
+
     print("=" * 80)
     
     # Determine input files
@@ -231,6 +275,7 @@ EXAMPLES:
     print(f"📁 Files to process: {len(file_paths)}")
     print(f"📂 Output directory: {args.output_dir}")
 
+
     # Show metadata info
     if args.law_title or args.law_no or args.law_id:
         print(f"📋 Metadata:")
@@ -246,10 +291,12 @@ EXAMPLES:
             print(f"   - Effective Date: {args.effective_date}")
         if args.signer:
             print(f"   - Signer: {args.signer}")
+>>>>>>> 985580bf68add13b2bc7f26f77585e9417bff953
     
     if args.dry_run:
         print(f"🔍 DRY RUN MODE - No files will be written")
     
+
     if args.AI:
         print(f"🤖 AI Review:")
         print(f"   - Max files sample: {args.max_files_sample}")
@@ -258,6 +305,7 @@ EXAMPLES:
         if args.strict_ok_only:
             print(f"   - Strict OK only: ENABLED")
     
+
     print("=" * 80)
     
     # Create pipeline
@@ -267,6 +315,7 @@ EXAMPLES:
     chunks, summary = pipeline.process_files(
         file_paths=file_paths,
         default_law_no=args.law_no,
+
         default_law_title=args.law_title,
         default_law_id=args.law_id,
         default_issued_date=args.issued_date,
@@ -286,6 +335,7 @@ EXAMPLES:
         else:
             print(f"\n✅ All {validation['valid_chunks']} chunks are valid!")
     
+
     # AI Review if requested
     ai_review_passed = True
     if args.AI:
@@ -382,6 +432,7 @@ EXAMPLES:
             else:
                 print(f"⚠️  Proceeding without AI confirmation...")
     
+
     if args.dry_run:
         print(f"\n🔍 DRY RUN: Would save {len(chunks)} chunks")
         return
@@ -423,4 +474,3 @@ EXAMPLES:
 
 if __name__ == "__main__":
     main()
-

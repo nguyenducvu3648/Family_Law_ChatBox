@@ -1,64 +1,57 @@
-import asyncio
 import os
 import re
-import json
 import time
+import json
+import asyncio
 import logging
 from datetime import datetime
-from textwrap import dedent
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
-import gradio as gr
+# ========== CONFIG (tương đương core.config) ==========
 from dotenv import load_dotenv
-from qdrant_client import QdrantClient
-from qdrant_client.http.models import Filter, FieldCondition, MatchValue
-from sentence_transformers import SentenceTransformer
-import google.generativeai as genai
-from qdrant_client.http.models import Filter, FieldCondition, MatchValue
-from tenacity import retry, stop_after_attempt, wait_exponential
-
-# ================== CẤU HÌNH MÔI TRƯỜNG ==================
 load_dotenv()
+
 QDRANT_URL = os.getenv("QDRANT_URL", "").strip()
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "").strip()
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL_ID = os.getenv("GEMINI_MODEL_ID", "gemini-1.5-flash") # Đã đổi sang 1.5 flash
-INTENT_DEBUG = os.getenv("INTENT_DEBUG", "0").strip() in {"1", "true", "TRUE", "yes", "on"}
+GEMINI_MODEL_ID = os.getenv("GEMINI_MODEL_ID", "gemini-2.5-flash")
+
+INTENT_DEBUG = os.getenv("INTENT_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-CASUAL_MAX_WORDS = int(os.getenv("CASUAL_MAX_WORDS", "0").strip() or 0)  # 0 = không giới hạn
+CASUAL_MAX_WORDS = int(os.getenv("CASUAL_MAX_WORDS", "0").strip() or 0)
 INTENT_RAW_PREVIEW_LIMIT = int(os.getenv("INTENT_RAW_PREVIEW_LIMIT", "240").strip() or 240)
 INTENT_FALLBACK_CASUAL = os.getenv(
-"INTENT_FALLBACK_CASUAL",
-"Chào bạn, mình có thể hỗ trợ câu hỏi về Luật Hôn nhân & Gia đình. Bạn muốn hỏi nội dung gì?",
+    "INTENT_FALLBACK_CASUAL",
+    "Chào bạn, mình có thể hỗ trợ câu hỏi về Luật Hôn nhân & Gia đình. Bạn muốn hỏi nội dung gì?",
 ).strip()
 
-if not (QDRANT_URL and QDRANT_API_KEY):
-    raise RuntimeError("Thiếu QDRANT_URL hoặc QDRANT_API_KEY trong tệp .env")
-
-# ================== THIẾT LẬP LOGGING ==================
-
-# SỬA LỖI: Thêm định nghĩa KVFormatter
+# ========== LOGGING SETUP (tương đương logging_setup.py) ==========
 class KVFormatter(logging.Formatter):
-    """Formatter để thêm các cặp key=value từ record.extra"""
-    def format(self, record):
-        # Format a base message
-        msg = super().format(record)
-        # Check if there's a __kv__ extra
-        if hasattr(record, "__kv__") and record.__kv__:
-            kv_pairs = " ".join(f"{k}={v}" for k, v in record.__kv__.items())
-            # Thêm vào cuối message, phân tách bằng |
-            msg = f"{msg} | {kv_pairs}"
-        return msg
+    def format(self, record: logging.LogRecord) -> str:
+        base = super().format(record)
+        extras = []
+        extras_dict = getattr(record, "__kv__", {})
+        if isinstance(extras_dict, dict):
+            for k, v in extras_dict.items():
+                try:
+                    extras.append(f"{k}={v}")
+                except Exception:
+                    continue
+        return base + (" | " + ",".join(extras) if extras else "")
 
 LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-handlers = [
-    logging.StreamHandler(),
-    logging.FileHandler("botchat_honnhan.log", encoding="utf-8"),
-]
+handlers = [logging.StreamHandler()]
+# Add file handler if writable
+try:
+    fh = logging.FileHandler("botchat_honnhan.log", encoding="utf-8")
+    handlers.append(fh)
+except Exception:
+    pass
+
 for h in handlers:
-    h.setFormatter(KVFormatter(LOG_FORMAT)) # Sử dụng KVFormatter
+    h.setFormatter(KVFormatter(LOG_FORMAT))
 
 root_logger = logging.getLogger()
 root_logger.handlers = []
@@ -69,14 +62,20 @@ for h in handlers:
 app_log = logging.getLogger("app")
 metrics_logger = logging.getLogger("metrics")
 if not metrics_logger.handlers:
-    fh = logging.FileHandler("metrics.log", encoding="utf-8")
-    fh.setFormatter(logging.Formatter("%(message)s"))
-    metrics_logger.addHandler(fh)
-    metrics_logger.setLevel(logging.INFO)
+    try:
+        fhm = logging.FileHandler("metrics.log", encoding="utf-8")
+        fhm.setFormatter(logging.Formatter("%(message)s"))
+        metrics_logger.addHandler(fhm)
+        metrics_logger.setLevel(logging.INFO)
+    except Exception:
+        pass
 
 def log_step(event: str, **kv):
     kvpairs = ",".join([f"{k}={v}" for k, v in kv.items()])
-    metrics_logger.info(f"ts={int(time.time())},evt={event},{kvpairs}")
+    try:
+        metrics_logger.info(f"ts={int(time.time())},evt={event},{kvpairs}")
+    except Exception:
+        pass
 
 def log_time(func):
     import functools
@@ -91,55 +90,9 @@ def log_time(func):
                 f"Thời gian thực thi {func.__name__}",
                 extra={"__kv__": {"thoi_gian": f"{elapsed:.4f} giây"}},
             )
-    
-    @functools.wraps(func)
-    async def async_wrapper(*args, **kwargs):
-        t0 = time.perf_counter()
-        try:
-            return await func(*args, **kwargs)
-        finally:
-            elapsed = time.perf_counter() - t0
-            app_log.info(
-                f"Thời gian thực thi {func.__name__}",
-                extra={"__kv__": {"thoi_gian": f"{elapsed:.4f} giây"}},
-            )
-            
-    if asyncio.iscoroutinefunction(func):
-        return async_wrapper
-    else:
-        return sync_wrapper
+    return sync_wrapper
 
-# ================== KHỞI TẠO ==================
-client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=True)
-embedder = SentenceTransformer(EMBEDDING_MODEL)
-
-genai.configure(api_key=GEMINI_API_KEY)
-INTENT_SYSTEM_PROMPT = dedent("""
-Bạn là trợ lý về Luật Hôn nhân & Gia đình Việt Nam.
-Trả về **JSON thuần** (không markdown, không lời dẫn).
-
-Schema một trong các dạng:
-1) {"intent":"casual","answer":"..."}
-2) {"intent":"legal_answer","normalized_query":"...","original_query":"..."}
-3) {"intent":"law_search","filters":{"article_no":int?,"clause_no":int?,"point_letter":str?,"chapter_number":int?}}
-
-Quy tắc xác định intent:
-- Hỏi về điều/khoản/chương/mục cụ thể → law_search.
-- Hỏi xã giao/chào hỏi → casual.
-- Nhắc số điều/khoản nhưng hỏi tình huống thực tế, áp dụng, thủ tục → legal_answer.
-- Luôn dựa vào **mục đích câu hỏi**, không chỉ dựa vào số điều/khoản.
-
-Nếu intent = casual thì bắt buộc có answer (tiếng Việt, lịch sự).
-""")
-gemini_model = genai.GenerativeModel(
-    model_name=GEMINI_MODEL_ID,
-    system_instruction=INTENT_SYSTEM_PROMPT,
-)
-answer_model = genai.GenerativeModel(model_name=GEMINI_MODEL_ID)
-
-def _safe_truncate(text: str, limit: int = 800) -> str:
-    return text if text and len(text) <= limit else (text[:limit] + "…(cắt)") if text else ""
-
+# ========== UTILS (tương đương utils.py) ==========
 LEGAL_HINTS = re.compile(
     r"(?i)\b(điều|khoản|điểm|chương|hôn nhân|ly hôn|ly thân|nuôi con|tài sản|"
     r"quan hệ vợ chồng|kết hôn|hủy kết hôn|chung sống như vợ chồng|cấp dưỡng|giám hộ)\b"
@@ -148,6 +101,92 @@ LEGAL_HINTS = re.compile(
 def looks_like_legal(query: str) -> bool:
     return bool(LEGAL_HINTS.search(query or ""))
 
+def _safe_truncate(text: str, limit: int = 800) -> str:
+    return text if text and len(text) <= limit else (text[:limit] + "…(cắt)") if text else ""
+
+def normalize_legal_query(query: str) -> dict:
+    original = (query or "").strip()
+    text = re.sub(r"\s+", " ", original).strip()
+    text = text[0].upper() + text[1:] if text else text
+
+    corrections = {
+        "nghĩ vụ": "nghĩa vụ",
+        "cấp dưởng": "cấp dưỡng",
+        "nuôi dưởng": "nuôi dưỡng",
+        "pháp luât": "pháp luật",
+        "hôn nhân gia đình": "hôn nhân và gia đình",
+        "truy tố hình sự": "truy cứu trách nhiệm hình sự",
+        "được phép không": "có được không",
+        "được": "được",
+        "phai": "phải",
+        "co": "có",
+    }
+    for wrong, right in corrections.items():
+        text = re.sub(rf"\b{wrong}\b", right, text, flags=re.IGNORECASE)
+
+    text = re.sub(r"\s*[.!]+\s*", ". ", text)
+    text = text.strip().rstrip(".").strip()
+
+    intent = "general_legal"
+
+    if re.search(r"\b(phân biệt|so sánh|khác nhau|điểm giống|điểm khác|giữa)\b", text, flags=re.IGNORECASE):
+        intent = "compare"
+    elif re.search(r"\b(phải|có|được|bị|nên)\b", text, flags=re.IGNORECASE):
+        intent = "true_false"
+    elif re.search(
+        r"\b(nếu|trường hợp|giả sử|muốn hỏi|muốn biết|nên|có nên|làm sao|làm thế nào|cách nào|xử lý ra sao|xử lý thế nào|khởi kiện|hòa giải|phải làm gì)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        intent = "advice"
+    elif re.search(r"\b(là gì|được hiểu như thế nào|định nghĩa)\b", text, flags=re.IGNORECASE):
+        intent = "definition"
+    elif re.search(r"\b(mức phạt|xử phạt|phạt tiền|chế tài)\b", text, flags=re.IGNORECASE):
+        intent = "punishment"
+    elif re.search(r"\b(theo luật|theo quy định|căn cứ)\b", text, flags=re.IGNORECASE):
+        intent = "law_reference"
+    elif re.search(
+        r"\b(là|thuộc|bao gồm|gồm|được coi là|được xem là|được xác định là|có nghĩa là|được tính là|phải|được quyền|có nghĩa vụ|chịu trách nhiệm)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        intent = "true_false"
+        if not text.endswith("?"):
+            text = text.rstrip(".") + "?"
+
+    if intent == "general_legal":
+        if re.search(r"\b(là|thuộc|bao gồm|gồm|được coi là|được xem là|được xác định là|có nghĩa là|được tính là|phải|được quyền|có nghĩa vụ|chịu trách nhiệm)\b", text, flags=re.IGNORECASE):
+            intent = "true_false"
+            if not text.endswith("?"):
+                text = text.rstrip(".") + "?"
+
+    if not text.endswith("?"):
+        if intent == "true_false":
+            if not re.search(r"\b(phải không|có đúng không|đúng không|được không)\b", text, flags=re.IGNORECASE):
+                text += " phải không?"
+        elif intent == "advice":
+            text += "?"
+        elif intent == "law_reference":
+            if not re.search(r"\btheo quy định\b", text, flags=re.IGNORECASE):
+                text += " theo quy định pháp luật?"
+            else:
+                text += "?"
+        elif intent == "punishment":
+            text += " bị xử lý thế nào?"
+        else:
+            text += "?"
+
+    text = re.sub(r"[!?]{2,}", "?", text)
+    text = text.replace(",,", ",").replace("..", ".")
+    text = text.strip()
+
+    return {
+        "normalized_query": text,
+        "intent_hint": intent,
+        "original_query": original
+    }
+
+# ========== SIMPLE CACHE (tương đương cache.py) ==========
 class SimpleTTLCache:
     def __init__(self, ttl_seconds: int = 1800, max_items: int = 512):
         self.ttl = ttl_seconds
@@ -177,274 +216,533 @@ class SimpleTTLCache:
 embed_cache = SimpleTTLCache(ttl_seconds=3600, max_items=1024)
 search_cache = SimpleTTLCache(ttl_seconds=900, max_items=1024)
 
-# @log_time
-def encode_query(text: str):
-    key = f"{EMBEDDING_MODEL}|query|{text}"
-    v = embed_cache.get(key)
-    if v is not None:
-        return v
-    vec = embedder.encode([f"query: {text}"], normalize_embeddings=True)[0].tolist()
-    embed_cache.set(key, vec)
-    return vec
+# ========== PROMPT LOADER (thay thế prompt_loader.py) ==========
+# We'll embed the system prompt, intent prompt, and answer template as strings.
+SYSTEM_PROMPT = """{system_prompt_placeholder}"""  # will be replaced below
+INTENT_PROMPT = """You are an assistant to detect intent (from intent.txt schema)."""
+ANSWER_PROMPT_TEMPLATE = """{answer_template_placeholder}"""  # replaced below
 
-# ================== PHÂN TÍCH Ý ĐỊNH (INTENT) ==================
-# @log_time
-def _intent_via_gemini(query: str) -> Dict[str, Any]:
+# Fill from user-provided text blocks (from your messages)
+INTENT_TXT = r'''
+Bạn là trợ lý về Luật Hôn nhân & Gia đình Việt Nam.
+Trả về **JSON thuần** (không markdown, không lời dẫn).
+
+Schema một trong các dạng:
+1) {"intent":"casual","answer":"..."}
+2) {"intent":"legal_answer","normalized_query":"...","original_query":"..."}
+3) {"intent":"law_search","query_type":"fetch|compare|definition","filters":{"article_no":int?,"clause_no":int?,"point_letter":str?,"chapter_number":int?},"normalized_query":"...","original_query":"..."}
+
+Quy tắc xác định intent:
+- Chỉ hỏi về điều/khoản/chương/điểm cụ thể → law_search với query_type="fetch" và điền filters.
+- So sánh/phân biệt các điều khoản hoặc khái niệm luật (ví dụ: "so sánh ly hôn đơn phương và thuận tình", "phân biệt tài sản chung và riêng") → law_search với query_type="compare", không cần filters.
+- Giải thích khái niệm pháp lý (ví dụ: "tài sản chung là gì?", "ly hôn đơn phương nghĩa là gì?", "quyền nuôi con được quy định như thế nào?") → law_search với query_type="definition", không cần filters.
+- Giao tiếp thông thường, chào hỏi → casual.
+- Các câu hỏi tình huống, áp dụng luật, thủ tục, xin tư vấn → legal_answer.
+- Luôn dựa vào **mục đích thực sự** của câu hỏi, không chỉ dựa vào từ khóa số điều/khoản.
+
+Với law_search:
+- Nếu hỏi điều/khoản/điểm/chương CỤ THỂ → query_type="fetch", phải điền filters
+- Nếu so sánh/phân biệt → query_type="compare", không điền filters
+- Nếu giải thích khái niệm/định nghĩa → query_type="definition", không điền filters
+
+Nếu intent = casual thì bắt buộc có trường "answer" (tiếng Việt, lịch sự).
+Nếu intent = law_search thì bắt buộc có "query_type" và "normalized_query".
+'''.strip()
+
+SYSTEM_PROMPT_TXT = r'''
+Bạn là một trợ lý AI chuyên về Luật Hôn nhân và Gia đình Việt Nam, được thiết kế để cung cấp thông tin pháp lý chính xác và khách quan.
+
+--- (tóm tắt, dùng cho config nội bộ)
+'''.strip()
+
+ANSWER_TXT = r'''
+Bạn là trợ lý pháp lý chuyên về Luật Hôn nhân & Gia đình Việt Nam.
+Dưới đây là câu hỏi người dùng và các điều luật liên quan.
+
+---
+
+**Câu hỏi:**  
+{query}
+
+{history_block}
+
+**Ngữ cảnh pháp lý:**  
+{context}
+
+---
+
+**Trích dẫn:**
+- <Liệt kê NGUYÊN VĂN tất cả các điều/khoản/điểm được sử dụng từ `context`. Mỗi mục bắt đầu bằng "•" hoặc "-". Ghi rõ tên gọi: "Điểm a, Khoản 1, Điều 8: <nội dung nguyên văn>".>
+
+**Giải thích:**
+- <Từ 1-3 câu, giải thích ngắn gọn cách các điều luật trên áp dụng vào tình huống. Nêu rõ các khả năng nếu có.>
+
+**Kết luận:**
+- <Một câu duy nhất, trả lời trực tiếp vào câu hỏi dựa trên giải thích.>
+
+---
+'''.strip()
+
+# Apply into placeholders
+SYSTEM_PROMPT = SYSTEM_PROMPT_TXT
+INTENT_PROMPT = INTENT_TXT
+ANSWER_PROMPT = ANSWER_TXT
+
+def load_prompt(base_dir: str, prompt_type: str) -> str:
+    # Minimal loader: return corresponding embedded strings
+    if prompt_type == "intent":
+        return INTENT_PROMPT
+    if prompt_type == "system":
+        return SYSTEM_PROMPT
+    if prompt_type == "answer":
+        return ANSWER_PROMPT
+    return ""
+
+# ========== MODELS & EXTERNAL CLIENTS (tương đương models.py) ==========
+# We'll attempt to import heavy libs; if not available, create mocks.
+try:
+    import google.generativeai as genai
+    GENAI_AVAILABLE = True
+    genai.configure(api_key=GEMINI_API_KEY)
+except Exception:
+    genai = None
+    GENAI_AVAILABLE = False
+    app_log.warning("google.generativeai không khả dụng — sử dụng mock LLM", extra={"__kv__": {}})
+
+# Qdrant client mock / real try
+try:
+    from qdrant_client import QdrantClient
+    QDRANT_AVAILABLE = True
+except Exception:
+    QdrantClient = None
+    QDRANT_AVAILABLE = False
+    app_log.warning("qdrant_client không khả dụng — sử dụng mock Qdrant client", extra={"__kv__": {}})
+
+# Fastembed / transformers / torch / reranker
+try:
+    from fastembed import TextEmbedding, SparseTextEmbedding, LateInteractionTextEmbedding
+    FASTEMBED_AVAILABLE = True
+except Exception:
+    TextEmbedding = None
+    SparseTextEmbedding = None
+    LateInteractionTextEmbedding = None
+    FASTEMBED_AVAILABLE = False
+    app_log.warning("fastembed không khả dụng — sử dụng mock embedding", extra={"__kv__": {}})
+
+try:
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+    import torch
+    TRANSFORMERS_AVAILABLE = True
+except Exception:
+    AutoTokenizer = None
+    AutoModelForSequenceClassification = None
+    torch = None
+    TRANSFORMERS_AVAILABLE = False
+    app_log.warning("transformers/torch không khả dụng — sử dụng mock reranker", extra={"__kv__": {}})
+
+# Initialize or mock components
+# Qdrant client
+if QDRANT_AVAILABLE and QDRANT_URL and QDRANT_API_KEY:
     try:
-        cfg = genai.types.GenerationConfig(
-            temperature=0.0,
-            max_output_tokens=192,
-            response_mime_type="application/json",
-        )
-        resp = gemini_model.generate_content(
-            [
-                {
-                    "role": "user",
-                    "parts": [f"Câu hỏi: {query}\nHãy trả JSON thuần phù hợp schema đã nêu."],
-                }
-            ],
-            generation_config=cfg,
-        )
-
-        candidates = getattr(resp, "candidates", None) or []
-        first_cand = candidates[0] if candidates else None
-        finish_reason = getattr(first_cand, "finish_reason", None)
-        safety = []
-        try:
-            if first_cand and getattr(first_cand, "safety_ratings", None):
-                for s in first_cand.safety_ratings:
-                    cat = getattr(s, "category", "")
-                    prob = getattr(s, "probability", "")
-                    safety.append(f"{cat}:{prob}")
-        except Exception:
-            pass
-
-        raw = getattr(resp, "text", "") or ""
-        app_log.info(
-            "Kết quả phân tích ý định",
-            extra={
-                "__kv__": {
-                    "do_dai": len(raw),
-                    "xem_truoc": _safe_truncate(raw, INTENT_RAW_PREVIEW_LIMIT),
-                    "so_ung_vien": len(candidates),
-                    "ly_do_ket_thuc": finish_reason,
-                    "bao_mat": ";".join(safety[:6]),
-                }
-            },
-        )
-
-        if finish_reason == 2 or not raw:
-            log_step("intent_block", ly_do=str(finish_reason))
-            app_log.warning(
-                "Phân tích ý định bị chặn",
-                extra={"__kv__": {"ly_do_ket_thuc": finish_reason, "do_dai_raw": len(raw)}}
-            )
-            return {"intent": "casual", "answer": INTENT_FALLBACK_CASUAL}
-
-        data = json.loads(raw) if raw else {}
-        if not isinstance(data, dict):
-            app_log.warning("Kết quả phân tích không phải dict")
-            return {"intent": "casual", "answer": INTENT_FALLBACK_CASUAL}
-        out: Dict[str, Any] = {}
-        for k in ("intent", "answer", "normalized_query", "filters", "original_query"):
-            if k in data and data[k] not in (None, ""):
-                out[k] = data[k]
-        app_log.info(
-            "Ý định đã phân tích",
-            extra={
-                "__kv__": {
-                    "loai_y_dinh": out.get("intent", ""),
-                    "co_tra_loi": int("answer" in out and bool(out.get("answer"))),
-                    "co_bo_loc": int("filters" in out and bool(out.get("filters"))),
-                    "do_dai_tra_loi": len(out.get("answer", "") or ""),
-                    "ly_do_ket_thuc": finish_reason,
-                }
-            },
-        )
-        return out
+        client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=True)
     except Exception as e:
-        app_log.warning("Lỗi phân tích ý định", extra={"__kv__": {"loi": str(e)}})
-        return {"intent": "casual", "answer": INTENT_FALLBACK_CASUAL}
+        app_log.warning("Không thể khởi tạo QdrantClient thật, dùng mock", extra={"__kv__": {"loi": str(e)}})
+        client = None
+else:
+    client = None
 
-# @log_time
-def analyze_intent(query: str) -> Dict[str, Any]:
-    data = _intent_via_gemini(query)
-    intent = data.get("intent")
-    answer = data.get("answer", "")
-    normalized_query = data.get("normalized_query", "") or query
-    original_query = data.get("original_query", "")
-    filters = data.get("filters", {}) or {}
+# Embedding models
+if FASTEMBED_AVAILABLE:
+    try:
+        dense_embedding_model = TextEmbedding(EMBEDDING_MODEL)
+        sparse_embedding_model = SparseTextEmbedding("Qdrant/bm25")
+        late_interaction_embedding_model = LateInteractionTextEmbedding("colbert-ir/colbertv2.0")
+    except Exception:
+        dense_embedding_model = sparse_embedding_model = late_interaction_embedding_model = None
+        FASTEMBED_AVAILABLE = False
+else:
+    dense_embedding_model = sparse_embedding_model = late_interaction_embedding_model = None
 
-    if intent not in {"casual", "legal_answer", "law_search"}:
-        if re.search(r"(?i)\bđiều\s*\d+", query) or re.search(r"(?i)\bkhoản\s*\d+", query):
-            intent = "law_search"
-        elif looks_like_legal(query):
-            intent = "legal_answer"
+# reranker
+if TRANSFORMERS_AVAILABLE:
+    try:
+        rerank_tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-reranker-base")
+        rerank_model = AutoModelForSequenceClassification.from_pretrained("BAAI/bge-reranker-base")
+        rerank_model.eval()
+    except Exception:
+        rerank_tokenizer = rerank_model = None
+        TRANSFORMERS_AVAILABLE = False
+else:
+    rerank_tokenizer = rerank_model = None
+
+# genai models wrapper (gemini_model, answer_model) or mocks
+class _MockGenerativeModel:
+    def __init__(self, model_name=None, system_instruction=None):
+        self.model_name = model_name
+        self.system_instruction = system_instruction
+
+    def generate_content(self, prompt, generation_config=None, stream=False):
+        # If stream=True, yield small chunks; else return object with .candidates etc.
+        if stream:
+            # return an iterator that yields objects with .text attribute
+            def it():
+                pieces = ["Xin chào. ", "Đây là câu trả lời giả lập. "]
+                for p in pieces:
+                    class O: pass
+                    o = O()
+                    o.text = p
+                    yield o
+            return it()
         else:
-            intent = "casual"
-        log_step("intent_fallback", do_dai_query=len(query))
+            class Candidate:
+                def __init__(self, text):
+                    self.content = type("C", (), {"parts":[ type("P", (), {"text": text}) ]})
+                    self.finish_reason = 0
+                    self.safety_ratings = []
+            class Resp:
+                def __init__(self, text):
+                    self.candidates = [Candidate(text)]
+            # If prompt contains some JSON-like response requirement, return an empty candidate
+            return Resp('')
 
-    log_step("intent", loai=intent, co_legal=str(looks_like_legal(query)))
-    app_log.info("Quyết định ý định", extra={"__kv__": {"loai_y_dinh": intent}})
-    return {
-        "intent": intent,
-        "answer": answer,
-        "normalized_query": normalized_query,
-        "original_query": original_query,
-        "filters": filters,
-    }
+if GENAI_AVAILABLE:
+    try:
+        gemini_model = genai.GenerativeModel(model_name=GEMINI_MODEL_ID, system_instruction=load_prompt(".", "intent"))
+        answer_model = genai.GenerativeModel(model_name=GEMINI_MODEL_ID, system_instruction=load_prompt(".", "answer"))
+    except Exception as e:
+        app_log.warning("Không thể khởi tạo GenerativeModel thật, dùng mock", extra={"__kv__": {"loi": str(e)}})
+        gemini_model = _MockGenerativeModel(model_name=GEMINI_MODEL_ID, system_instruction=load_prompt(".", "intent"))
+        answer_model = _MockGenerativeModel(model_name=GEMINI_MODEL_ID, system_instruction=load_prompt(".", "answer"))
+else:
+    gemini_model = _MockGenerativeModel(model_name=GEMINI_MODEL_ID, system_instruction=load_prompt(".", "intent"))
+    answer_model = _MockGenerativeModel(model_name=GEMINI_MODEL_ID, system_instruction=load_prompt(".", "answer"))
 
-# ================== TÌM KIẾM VECTOR ==================
-# @log_time
-def _build_filter(query_text: str) -> Optional[Filter]:
-    conds: List[FieldCondition] = []
-    m = re.search(r"(?i)\bđiều\s*(\d+)\b", query_text)
-    if m:
-        conds.append(FieldCondition(key="article_no", match=MatchValue(value=int(m.group(1)))))
-    m = re.search(r"(?i)\bkhoản\s*(\d+)\b", query_text)
-    if m:
-        conds.append(FieldCondition(key="clause_no", match=MatchValue(value=int(m.group(1)))))
-    m = re.search(r"(?i)\bđiểm\s*([a-z])\b", query_text)
-    if m:
-        conds.append(FieldCondition(key="point_letter", match=MatchValue(value=m.group(1).lower())))
-    m = re.search(r"(?i)\bchương\s*(\d+)\b", query_text)
-    if m:
-        conds.append(FieldCondition(key="chapter_number", match=MatchValue(value=int(m.group(1)))))
-    return Filter(must=conds) if conds else None
+# If client is None, provide mock methods used in code (scroll, query_points)
+class _MockClient:
+    def scroll(self, collection_name, scroll_filter=None, limit=10, with_payload=False):
+        # return empty result
+        return [], None
 
+    def query_points(self, collection_name, prefetch=None, query=None, using=None, query_filter=None, with_payload=False, limit=10):
+        # return an object with .points empty
+        class R:
+            def __init__(self):
+                self.points = []
+        return R()
+
+if client is None:
+    client = _MockClient()
+
+# ========== TOOLS (tương đương tools.py) ==========
+def rerank_with_baai(query, docs, top_k=15):
+    # If real reranker available, use it; else simple heuristic: sort by existing score fields
+    if not docs:
+        return docs
+    if TRANSFORMERS_AVAILABLE and rerank_model and rerank_tokenizer:
+        pairs = [(query, d["content"]) for d in docs]
+        inputs = rerank_tokenizer(
+            [p[0] for p in pairs],
+            [p[1] for p in pairs],
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+            max_length=512
+        )
+        with torch.no_grad():
+            scores = rerank_model(**inputs).logits.view(-1).float()
+        for d, s in zip(docs, scores):
+            d["baai_score"] = float(s)
+        reranked = sorted(docs, key=lambda x: x["baai_score"], reverse=True)
+        return reranked[:top_k]
+    else:
+        # fallback sort by any score fields
+        for d in docs:
+            d["baai_score"] = float(d.get("colbert_score") or d.get("score") or 0.0)
+        return sorted(docs, key=lambda x: x["baai_score"], reverse=True)[:top_k]
+
+def tokenize(text):
+    return re.findall(r'\w+', text.lower())
+
+from qdrant_client.http.models import Filter as QFilter, FieldCondition, MatchValue  # may fail if qdrant package missing
+
+def _build_filter(query_text: str):
+    conds = []
+    # Try safe extraction; if qdrant models not present, just return None or a simple dict
+    try:
+        m = re.search(r"(?i)\bđiều\s*(\d+)\b", query_text)
+        if m:
+            conds.append(FieldCondition(key="metadata.article_no", match=MatchValue(value=int(m.group(1)))))
+        m = re.search(r"(?i)\bkhoản\s*(\d+)\b", query_text)
+        if m:
+            conds.append(FieldCondition(key="metadata.clause_no", match=MatchValue(value=int(m.group(1)))))
+        m = re.search(r"(?i)\bđiểm\s*([a-z])\b", query_text)
+        if m:
+            conds.append(FieldCondition(key="metadata.point_letter", match=MatchValue(value=m.group(1).lower())))
+        m = re.search(r"(?i)\bchương\s*(\d+)\b", query_text)
+        if m:
+            conds.append(FieldCondition(key="metadata.chapter_number", match=MatchValue(value=int(m.group(1)))))
+        return QFilter(must=conds) if conds else None
+    except Exception:
+        return None
+
+# ========== FETCH (tương đương fetch.py) ==========
 @log_time
-async def search_law(query: str, top_k: int = 15, score_threshold: float = 0.42):
-    """Thực hiện vector search (đã loại bỏ BM25 và Reranker)"""
-    t0 = time.perf_counter()
-    app_log.info(
-        "Bắt đầu tìm kiếm vector",
-        extra={"__kv__": {"cau_hoi": _safe_truncate(query, 80), "top_k": top_k, "nguong_diem": score_threshold}},
-    )
+def _fetch(filters: Dict[str, Any], limit: int = 10):
+    must = []
+    mapping = {
+        "article_no": ("metadata.article_no", int),
+        "clause_no": ("metadata.clause_no", int),
+        "point_letter": ("metadata.point_letter", str),
+        "chapter_number": ("metadata.chapter_number", int)
+    }
+    for key, (field_path, caster) in mapping.items():
+        if key in filters and filters[key] not in (None, ""):
+            try:
+                val = caster(filters[key])
+                must.append(FieldCondition(key=field_path, match=MatchValue(value=val)))
+            except Exception as e:
+                app_log.warning("Lỗi ép kiểu dữ liệu bộ lọc", extra={"__kv__": {"truong": key, "gia_tri": filters[key], "loi": str(e)}})
+                try:
+                    val = str(filters[key])
+                    must.append(FieldCondition(key=field_path, match=MatchValue(value=val)))
+                except:
+                    pass
+    app_log.info("Bộ lọc tìm kiếm", extra={"__kv__": {"bo_loc_goc": str(filters), "dieu_kien_must": str(must)}})
+    if not must:
+        app_log.warning("Không có điều kiện must")
+        return []
+    flt = QFilter(must=must)
+    out = []
+    try:
+        scroll_res, _ = client.scroll(collection_name=COLLECTION_NAME, scroll_filter=flt, limit=min(64, max(5, limit)), with_payload=True)
+        app_log.info("Kết quả tìm kiếm Qdrant", extra={"__kv__": {"so_luong": len(scroll_res), "collection": COLLECTION_NAME}})
+        for r in scroll_res:
+            p = getattr(r, "payload", {}) or {}
+            meta = p.get("metadata", {})
+            out.append({
+                "chapter": meta.get("chapter", ""),
+                "chapter_number": meta.get("chapter_number", ""),
+                "article_no": meta.get("article_no", ""),
+                "article_title": meta.get("article_title", ""),
+                "clause_no": meta.get("clause_no", ""),
+                "point_letter": meta.get("point_letter", ""),
+                "content": (p.get("content") or "").strip(),
+                "score": 1.0,
+            })
+            if len(out) >= limit:
+                break
+    except Exception as e:
+        app_log.error("Lỗi khi tìm kiếm Qdrant", extra={"__kv__": {"loi": str(e), "collection": COLLECTION_NAME}})
+        return []
+    if not out:
+        app_log.warning("Không tìm thấy kết quả", extra={"__kv__": {"bo_loc": str(filters)}})
+    return out
 
-    cache_key = f"search_vector_only|{COLLECTION_NAME}|{top_k}|{score_threshold}|{query}"
+# ========== SEARCH (tương đương search.py) ==========
+@log_time
+async def search_law(query: str, top_k: int = 10, score_threshold: float = 0.42):
+    t0 = time.perf_counter()
+    app_log.info("Bắt đầu tìm kiếm", extra={"__kv__": {"query": _safe_truncate(query, 80), "top_k": top_k}})
+    cache_key = f"search|{COLLECTION_NAME}|{top_k}|{score_threshold}|{query}"
     cached = search_cache.get(cache_key)
     if cached is not None:
-        app_log.info("Tìm kiếm vector từ bộ nhớ cache")
-        return cached
-
+        app_log.info("Tìm trong cache ✅")
+        return [], [], cached
     try:
-        # 1. Xây dựng bộ lọc (nếu có)
         flt = _build_filter(query)
-        
-        # 2. Mã hóa câu hỏi
-        t_embed0 = time.perf_counter()
-        vec = encode_query(query)
-        t_embed = time.perf_counter() - t_embed0
+        print("DEBUG: → Bắt đầu hybrid (dense + sparse) + ColBERT Rerank")
+        t_hybrid0 = time.perf_counter()
+        # Embedding generation (mock if not available)
+        if dense_embedding_model:
+            dense_vectors = next(dense_embedding_model.query_embed(query))
+        else:
+            dense_vectors = [0.0] * 768
+        if sparse_embedding_model:
+            sparse_vectors = next(sparse_embedding_model.query_embed(query))
+        else:
+            sparse_vectors = type("S", (), {"indices": [], "values": []})
+        if late_interaction_embedding_model:
+            late_vectors = next(late_interaction_embedding_model.query_embed(query))
+        else:
+            late_vectors = None
 
-        # 3. Truy vấn Qdrant
-        t_q0 = time.perf_counter()
-        results = client.query_points(
-            collection_name=COLLECTION_NAME,
-            query=vec,
-            with_payload=True,
-            limit=int(top_k),         # Chỉ lấy top_k
-            query_filter=flt,         # Áp dụng bộ lọc
-            score_threshold=float(score_threshold) # Áp dụng ngưỡng điểm
-        )
-        t_qdrant = time.perf_counter() - t_q0
-        
-        # 4. Định dạng kết quả
-        selected_docs = []
-        for r in results.points:
-            p = r.payload or {}
-            selected_docs.append({
-                "source_id": p.get("source_id", ""), # SỬA LỖI: Thêm source_id
-                "citation": p.get("exact_citation", ""),
-                "chapter_number": p.get("chapter_number", ""),
-                "article_no": p.get("article_no", ""),
-                "article_title": p.get("article_title", ""),
-                "clause_no": p.get("clause_no", ""),
-                "point_letter": p.get("point_letter", ""),
-                "content": (p.get("content") or "").strip(),
-                "score": float(r.score or 0.0), # Giữ 'score' để markdown dùng
+        prefetch = []
+        try:
+            from qdrant_client import models
+            prefetch = [
+                models.Prefetch(query=dense_vectors, using="bge-m3", limit=50, filter=flt),
+                models.Prefetch(query=models.SparseVector(indices=getattr(sparse_vectors, "indices", []), values=getattr(sparse_vectors, "values", [])), using="bm25", limit=50, filter=flt)
+            ]
+        except Exception:
+            prefetch = None
+
+        results = client.query_points(collection_name=COLLECTION_NAME, prefetch=prefetch, query=late_vectors, using="colbertv2.0", query_filter=flt, with_payload=True, limit=20)
+        colbert_docs = []
+        for point in getattr(results, "points", []):
+            payload = getattr(point, "payload", {}) or {}
+            meta = payload.get("metadata", {})
+            colbert_docs.append({
+                "chapter_number": meta.get("chapter_number", ""),
+                "chapter": meta.get("chapter", ""),
+                "article_no": meta.get("article_no", ""),
+                "article_title": meta.get("article_title", ""),
+                "clause_no": meta.get("clause_no", ""),
+                "point_letter": meta.get("point_letter", ""),
+                "content": (payload.get("content") or "").strip(),
+                "colbert_score": getattr(point, "score", 0.0),
             })
-
-        search_cache.set(cache_key, selected_docs)
-        
-        sk_top1 = selected_docs[0]['score'] if selected_docs else 0.0
-        
-        log_step(
-            "tim_kiem_vector",
-            k_yeu_cau=top_k,
-            k_tra_ve=len(selected_docs),
-            diem_top1=f"{sk_top1:.4f}",
-            t_nhung=f"{t_embed:.4f}",
-            t_qdrant=f"{t_qdrant:.4f}",
-            t_tong=f"{time.perf_counter()-t0:.4f}",
-        )
-        app_log.info(
-            "Tìm kiếm vector hoàn tất",
-            extra={"__kv__": {"so_luong": len(selected_docs), "diem_top1": f"{sk_top1:.4f}"}})
-        
-        # Trả về danh sách tài liệu duy nhất
-        return selected_docs
-        
+        print(f"DEBUG: Hybrid + ColBERT done ✅ | count: {len(colbert_docs)}")
+        t_baai0 = time.perf_counter()
+        if colbert_docs:
+            selected = rerank_with_baai(query, colbert_docs, top_k=top_k)
+            selected = [doc for doc in selected if doc.get("baai_score", 0.0) >= score_threshold]
+        else:
+            selected = []
+        print(f"DEBUG: BAAI rerank done ✅ | final: {len(selected)}")
+        t_hybrid = time.perf_counter() - t_hybrid0
+        t_baai = time.perf_counter() - t_baai0
+        search_cache.set(cache_key, selected)
+        sk_top1 = selected[0].get("baai_score", 0.0) if selected else 0.0
+        log_step("hybrid_search", k_tra_ve=len(selected), top1=f"{sk_top1:.4f}", t_hybrid=f"{t_hybrid:.4f}", t_baai=f"{t_baai:.4f}")
+        return [], [], selected
     except Exception as e:
-        app_log.error("Lỗi tìm kiếm vector", extra={"__kv__": {"loi": str(e)}})
-        log_step("tim_kiem_loi", thong_bao=str(e))
+        app_log.error("Lỗi tìm kiếm ❌", extra={"__kv__": {"error": str(e)}})
+        log_step("tim_kiem_loi", error=str(e))
         raise
 
-# ================== CÔNG CỤ RENDER ==================
-def law_line(d: Dict[str, Any]) -> Tuple[str, str, str]:
-    art = d.get("article_no")
-    cls = d.get("clause_no")
-    pt = d.get("point_letter")
-    parts = []
-    if pt:
-        parts.append(f"Điểm {pt}")
-    if cls:
-        parts.append(f"Khoản {cls}")
-    if art:
-        parts.append(f"Điều {art}")
-    cited = " ".join(parts)
-    chapter = f" (Chương {d.get('chapter_number')})" if d.get("chapter_number") else ""
-    title = f" — {d.get('article_title')}" if d.get("article_title") else ""
-    return cited, chapter, title
+# ========== LAW SEARCH HANDLER (tương đương law_search_handler.py) ==========
+@log_time
+async def handle_law_search(query: str, query_type: str, filters: Dict[str, Any]) -> List[Dict]:
+    has_filters = bool(filters and any(filters.get(k) not in (None, "", 0) for k in ["article_no", "clause_no", "point_letter", "chapter_number"]))
+    if has_filters:
+        app_log.info("🎯 LAW_SEARCH: Sử dụng FETCH", extra={"__kv__": {"query_type": query_type, "filters": str(filters), "method": "fetch"}})
+        log_step("law_search_method", method="fetch", query_type=query_type, has_filters=True)
+        docs = _fetch(filters, limit=10)
+        app_log.info("✅ FETCH hoàn thành", extra={"__kv__": {"so_luong_docs": len(docs)}})
+        return docs
+    else:
+        app_log.info("🔍 LAW_SEARCH: Sử dụng RAG", extra={"__kv__": {"query": _safe_truncate(query, 80), "query_type": query_type, "method": "rag_search"}})
+        log_step("law_search_method", method="rag_search", query_type=query_type, has_filters=False)
+        _, _, docs = await search_law(query, top_k=10, score_threshold=0.42)
+        app_log.info("✅ RAG hoàn thành", extra={"__kv__": {"so_luong_docs": len(docs), "top1_score": docs[0].get("baai_score", 0.0) if docs else 0.0}})
+        return docs
 
-def docs_to_markdown(docs: List[Dict[str, Any]]):
+@log_time
+async def process_law_search_intent(intent_result: Dict[str, Any]) -> Dict[str, Any]:
+    query = intent_result.get("normalized_query", "")
+    query_type = intent_result.get("query_type", "definition")
+    filters = intent_result.get("filters", {})
+    app_log.info("📋 Bắt đầu xử lý LAW_SEARCH", extra={"__kv__": {"query": _safe_truncate(query, 80), "query_type": query_type, "has_filters": bool(filters)}})
+    docs = await handle_law_search(query, query_type, filters)
+    return {
+        "documents": docs,
+        "query": query,
+        "query_type": query_type,
+        "filters": filters,
+        "method": "fetch" if filters else "rag_search",
+        "count": len(docs)
+    }
+
+# ========== RENDER (tương đương render.py) ==========
+def docs_to_markdown(docs: List[Dict[str, Any]]) -> str:
     if not docs:
-        return "❌ Không tìm thấy điều luật nào."
+        return "(Chưa có dữ liệu)"
     lines = []
-    for i, d in enumerate(docs, 1):
-        cited, chapter, title = law_line(d)
-        content = (d.get("content") or "").strip()
-        score = round(d.get("score", 0.0), 4)
-        sid = d.get("source_id", "")
-        lines.append(
-            f"**{i}. [{sid}] {cited}{chapter}{title}** \n" +
-            f"{content}  \n" +
-            f"<sub>Độ liên quan: {score}</sub>\n"
-        )
+    for i, doc in enumerate(docs, 1):
+        article_no = doc.get("article_no", "")
+        article_title = doc.get("article_title", "")
+        clause_no = doc.get("clause_no", "")
+        point_letter = doc.get("point_letter", "")
+        content = doc.get("content", "")[:150]
+        score = doc.get("baai_score") or doc.get("colbert_score") or doc.get("score", 0.0)
+        citation_parts = []
+        if article_no:
+            citation_parts.append(f"Điều {article_no}")
+        if clause_no:
+            citation_parts.append(f"Khoản {clause_no}")
+        if point_letter:
+            citation_parts.append(f"Điểm {point_letter}")
+        citation = " ".join(citation_parts) if citation_parts else "N/A"
+        lines.append(f"**{i}. {citation}**")
+        if article_title:
+            lines.append(f"*{article_title}*")
+        lines.append(f"Score: {score:.4f}")
+        lines.append(f"{content}...")
+        lines.append("")
     return "\n".join(lines)
 
-def paginate_docs(docs, page: int, page_size: int):
+def paginate_docs(docs: List[Dict[str, Any]], page: int, page_size: int) -> Tuple[List[Dict], int, int, int]:
+    if not docs:
+        return [], 0, 0, 1
     total = len(docs)
-    if total == 0:
-        return [], 0, 0, 0
-    page = max(1, int(page))
-    page_size = max(1, int(page_size))
-    start = (page - 1) * page_size
-    end = start + page_size
-    sliced = docs[start:end]
     total_pages = (total + page_size - 1) // page_size
-    return sliced, total, total_pages, start
+    current_page = max(1, min(page, total_pages))
+    start_idx = (current_page - 1) * page_size
+    end_idx = start_idx + page_size
+    paginated = docs[start_idx:end_idx]
+    return paginated, total, total_pages, current_page
 
-
-def docs_page_markdown(docs, page: int, page_size: int):
-    sliced, total, total_pages, start = paginate_docs(docs, page, page_size)
-    if total == 0:
+def docs_page_markdown(docs: List[Dict[str, Any]], page: int, page_size: int) -> Tuple[str, str]:
+    if not docs:
         return "(Chưa có dữ liệu)", " Trang 0/0"
-    body = docs_to_markdown(sliced)
-    page_label = f" Trang {page}/{total_pages} — hiển thị {start+1}–{min(start+len(sliced), total)} / {total}"
-    return f"**{page_label}**\n\n{body}", page_label
+    paginated, total, total_pages, current_page = paginate_docs(docs, page, page_size)
+    lines = []
+    start_idx = (current_page - 1) * page_size
+    for i, doc in enumerate(paginated, start=start_idx + 1):
+        article_no = doc.get("article_no", "")
+        article_title = doc.get("article_title", "")
+        clause_no = doc.get("clause_no", "")
+        point_letter = doc.get("point_letter", "")
+        content = doc.get("content", "")
+        score = doc.get("baai_score") or doc.get("colbert_score") or doc.get("score", 0.0)
+        citation_parts = []
+        if article_no:
+            citation_parts.append(f"Điều {article_no}")
+        if clause_no:
+            citation_parts.append(f"Khoản {clause_no}")
+        if point_letter:
+            citation_parts.append(f"Điểm {point_letter}")
+        citation = " ".join(citation_parts) if citation_parts else "N/A"
+        lines.append(f"### {i}. {citation}")
+        if article_title:
+            lines.append(f"**{article_title}**")
+        lines.append(f"*Score: {score:.4f}*")
+        lines.append("")
+        lines.append(content)
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+    markdown = "\n".join(lines)
+    page_label = f" Trang {current_page}/{total_pages}"
+    return markdown, page_label
 
-# ================== XÂY DỰNG PROMPT ==================
-# @log_time
+def format_citation(doc: Dict[str, Any]) -> str:
+    article_no = doc.get("article_no", "")
+    clause_no = doc.get("clause_no", "")
+    point_letter = doc.get("point_letter", "")
+    parts = []
+    if article_no:
+        parts.append(f"Điều {article_no}")
+    if clause_no:
+        parts.append(f"Khoản {clause_no}")
+    if point_letter:
+        parts.append(f"Điểm {point_letter}")
+    return " ".join(parts) if parts else "N/A"
+
+def format_doc_preview(doc: Dict[str, Any], max_length: int = 200) -> str:
+    citation = format_citation(doc)
+    article_title = doc.get("article_title", "")
+    content = doc.get("content", "")
+    preview = content[:max_length]
+    if len(content) > max_length:
+        preview += "..."
+    parts = [f"**{citation}**"]
+    if article_title:
+        parts.append(f"*{article_title}*")
+    parts.append(preview)
+    return "\n".join(parts)
+
+# ========== PROMPT BUILD (tương đương prompt.py) ==========
 def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None):
     history_block = ""
     if history_msgs:
@@ -455,16 +753,20 @@ def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None):
             role_label = "Người dùng" if role == "user" else "Trợ lý"
             lines.append(f"- {i}. {role_label}: {content}")
         history_block = "\nLịch sử hội thoại gần đây:\n" + "\n".join(lines)
-
+    def doc_priority(d):
+        text = (d.get("content") or "").lower()
+        if re.search(r"\b(trừ khi|ngoại lệ|nếu chưa bị tuyên bố|trường hợp|nhưng không)\b", text):
+            return 0
+        return 1
     docs_sorted = sorted(
         docs,
         key=lambda d: (
+            doc_priority(d),
             int(d.get("article_no") or 9999),
             int(d.get("clause_no") or 9999),
             str(d.get("point_letter") or ""),
         ),
     )
-
     context_lines = []
     for idx, d in enumerate(docs_sorted, 1):
         art = d.get("article_no")
@@ -482,52 +784,237 @@ def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None):
         title = f" — {d.get('article_title')}" if d.get("article_title") else ""
         content = (d.get("content") or "").strip()
         context_lines.append(f"{idx}) {cited}{chapter}{title}: {content}")
-
     context = "\n".join(context_lines) if context_lines else "❌ Không có điều luật nào."
-
-    prompt = dedent(f"""
-    Bạn là luật sư tư vấn Luật Hôn nhân & Gia đình, chỉ dùng trích đoạn trong danh sách sau.
-    Quy tắc:
-    - Câu hỏi Đúng/Sai → trả lời **Kết luận: Đúng/Sai** + lý do.
-    - Câu hỏi thường → trả lời **1–3 câu**, bám sát câu hỏi.
-    - **Trích dẫn nguyên văn** điều luật liên quan (Điểm–Khoản–Điều + nội dung), theo thứ tự.
-    - Nếu thiếu căn cứ → trả lời: **Không đủ căn cứ.**
-    - Câu hỏi ngoài luật → trả lời lịch sự, ngắn gọn, không viện dẫn luật.
-    ĐỊNH DẠNG TRẢ LỜI:
-    - Trích dẫn: <liệt kê toàn bộ Điểm–Khoản–Điều + nội dung>
-    - Giải thích: <1–3 câu, áp dụng tình huống>
-    - Kết luận: <kết luận ngắn gọn dựa vào câu hỏi và giải thích>
-
-    Câu hỏi hiện tại:
-    \"\"\"{query}\"\"\"{history_block}
-
-    Danh sách điều luật (top_k):
-    {context}
-    """).strip()
-
+    prompt = ANSWER_PROMPT.format(query=query, history_block=history_block, context=context)
     return prompt
 
-# ================== XỬ LÝ TRẢ LỜI LLM ==================
-# SỬA LỖI: Kích hoạt lại @retry
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-async def _gemini_stream_async(prompt, temperature: float):
-    """SỬA LỖI: Chuyển sang phiên bản async"""
-    cfg = genai.types.GenerationConfig(temperature=float(temperature))
-    # SỬA LỖI: Sử dụng generate_content_async
-    return await answer_model.generate_content_async(prompt, generation_config=cfg, stream=True)
+# ========== QUERY REWRITER (tương đương query_rewriter.py) ==========
+INSTRUCTIONS = (
+    "You are an expert at reformulating questions to be more precise and detailed.\n"
+    "Your task is to:\n"
+    "1. Analyze the user's question\n"
+    "2. Rewrite it to be more specific and search-friendly\n"
+    "3. Expand any acronyms or technical terms\n"
+    "4. Return ONLY the rewritten query without any additional text or explanations"
+)
+def _get_model_for_rewrite():
+    # Use gemini_model if available, else mock
+    return gemini_model
 
 @log_time
-async def stream_answer(prompt, temperature=0.2):
-    """SỬA LỖI: Chuyển sang async def để dùng 'async for'"""
+def rewrite_query(query: str) -> str:
+    if not (query and query.strip()):
+        return query
+    try:
+        model = _get_model_for_rewrite()
+        prompt = (
+            f"{INSTRUCTIONS}\n\n"
+            f"User question: {query}\n"
+            f"Output:"
+        )
+        if GENAI_AVAILABLE:
+            cfg = genai.types.GenerationConfig(temperature=0.0, max_output_tokens=96)
+            resp = model.generate_content(prompt, generation_config=cfg)
+            text = (getattr(resp, "text", None) or "").strip()
+        else:
+            # simple heuristics: expand abbreviations, return trimmed
+            text = query.strip()
+            if len(text) > 120:
+                text = text[:120]
+        out = text.splitlines()[0].strip() if text else query
+        app_log.info("Query rewritten", extra={"__kv__": {"from": query[:120], "to": out[:120]}})
+        return out or query
+    except Exception as e:
+        app_log.warning("Failed to rewrite query", extra={"__kv__": {"error": str(e)}})
+        return query
+
+# ========== INTENT (tương đương intent.py) ==========
+@log_time
+def _intent_via_gemini(query: str) -> Dict[str, Any]:
+    try:
+        if GENAI_AVAILABLE:
+            cfg = genai.types.GenerationConfig(
+                temperature=0.0,
+                max_output_tokens=192,
+                response_mime_type="application/json",
+            )
+            resp = gemini_model.generate_content(
+                [
+                    {
+                        "role": "user",
+                        "parts": [f"Câu hỏi: {query}\nHãy trả JSON thuần phù hợp schema đã nêu."],
+                    }
+                ],
+                generation_config=cfg,
+            )
+        else:
+            # mock: basic heuristics to decide intent
+            class Resp:
+                pass
+            resp = Resp()
+            resp.candidates = []
+            # produce a mock JSON in 'raw' if we can
+            raw = ""
+            if re.search(r"\b(điều|khoản|chương|điểm)\b", query, flags=re.IGNORECASE):
+                raw = json.dumps({"intent": "law_search", "query_type": "fetch", "filters": {}, "normalized_query": query})
+            elif looks_like_legal(query):
+                raw = json.dumps({"intent": "legal_answer", "normalized_query": query, "original_query": query})
+            else:
+                raw = json.dumps({"intent": "casual", "answer": INTENT_FALLBACK_CASUAL})
+            # wrap into candidate structure
+            class Candidate:
+                def __init__(self, text):
+                    self.content = type("C", (), {"parts":[ type("P", (), {"text": text}) ]})
+                    self.finish_reason = 0
+                    self.safety_ratings = []
+            resp.candidates = [Candidate(raw)]
+
+        candidates = getattr(resp, "candidates", None) or []
+        first_cand = candidates[0] if candidates else None
+        finish_reason = getattr(first_cand, "finish_reason", None)
+        safety = []
+        try:
+            if first_cand and getattr(first_cand, "safety_ratings", None):
+                for s in first_cand.safety_ratings:
+                    cat = getattr(s, "category", "")
+                    prob = getattr(s, "probability", "")
+                    safety.append(f"{cat}:{prob}")
+        except Exception:
+            pass
+
+        raw = ""
+        try:
+            if hasattr(resp, "candidates") and resp.candidates:
+                parts = getattr(resp.candidates[0].content, "parts", [])
+                if parts and hasattr(parts[0], "text"):
+                    raw = parts[0].text
+        except Exception as e:
+            app_log.warning("Không đọc được text từ phản hồi Gemini", extra={"__kv__": {"loi": str(e)}})
+
+        app_log.info(
+            "Kết quả phân tích ý định",
+            extra={
+                "__kv__": {
+                    "do_dai": len(raw),
+                    "xem_truoc": _safe_truncate(raw, INTENT_RAW_PREVIEW_LIMIT),
+                    "so_ung_vien": len(candidates),
+                    "ly_do_ket_thuc": finish_reason,
+                    "bao_mat": ";".join(safety[:6]),
+                }
+            },
+        )
+
+        if finish_reason == 2 or not raw:
+            if re.search(r"\b(điều|khoản|căn cứ|theo luật)\b", query, flags=re.IGNORECASE):
+                return {"intent": "law_search", "query_type": "fetch", "answer": "", "normalized_query": query}
+            elif looks_like_legal(query):
+                return {"intent": "legal_answer", "answer": "", "normalized_query": query}
+            else:
+                return {"intent": "casual", "answer": INTENT_FALLBACK_CASUAL}
+
+        data = json.loads(raw) if raw else {}
+        if not isinstance(data, dict):
+            app_log.warning("Kết quả phân tích không phải dict")
+            return {"intent": "casual", "answer": INTENT_FALLBACK_CASUAL}
+
+        out: Dict[str, Any] = {}
+        for k in ("intent", "answer", "normalized_query", "filters", "original_query", "query_type"):
+            if k in data and data[k] not in (None, ""):
+                out[k] = data[k]
+
+        app_log.info(
+            "Ý định đã phân tích",
+            extra={
+                "__kv__": {
+                    "loai_y_dinh": out.get("intent", ""),
+                    "loai_query": out.get("query_type", ""),
+                    "co_tra_loi": int("answer" in out and bool(out.get("answer"))),
+                    "co_bo_loc": int("filters" in out and bool(out.get("filters"))),
+                    "do_dai_tra_loi": len(out.get("answer", "") or ""),
+                    "ly_do_ket_thuc": finish_reason,
+                }
+            },
+        )
+        return out
+    except Exception as e:
+        app_log.warning("Lỗi phân tích ý định", extra={"__kv__": {"loi": str(e)}})
+        return {"intent": "casual", "answer": INTENT_FALLBACK_CASUAL}
+
+@log_time
+def analyze_intent(query: str) -> Dict[str, Any]:
+    normalized_input = normalize_legal_query(query)
+    cleaned_query = normalized_input["normalized_query"]
+    data = _intent_via_gemini(cleaned_query)
+    intent = data.get("intent")
+    answer = data.get("answer", "")
+    normalized_query_val = data.get("normalized_query", "") or cleaned_query
+    original_query = data.get("original_query") or normalized_input.get("original_query", "")
+    filters = data.get("filters", {}) or {}
+    query_type = data.get("query_type", "")
+
+    if intent not in {"casual", "law_search", "legal_answer"}:
+        if looks_like_legal(cleaned_query):
+            intent = "legal_answer"
+        else:
+            intent = "casual"
+        log_step("intent_fallback", do_dai_query=len(cleaned_query))
+
+    if intent == "law_search":
+        if not query_type or query_type not in {"fetch", "compare", "definition"}:
+            has_filters = bool(filters and any(
+                filters.get(k) not in (None, "", 0)
+                for k in ["article_no", "clause_no", "point_letter", "chapter_number"]
+            ))
+            query_type = "fetch" if has_filters else "definition"
+
+    log_step(
+        "intent",
+        loai=intent,
+        query_type=query_type,
+        goi_y=normalized_input.get("intent_hint"),
+        co_legal=str(looks_like_legal(cleaned_query))
+    )
+
+    app_log.info(
+        "Quyết định ý định",
+        extra={
+            "__kv__": {
+                "loai_y_dinh": intent,
+                "loai_query": query_type,
+                "co_filters": bool(filters)
+            }
+        }
+    )
+
+    return {
+        "intent": intent,
+        "query_type": query_type,
+        "answer": answer,
+        "normalized_query": normalized_query_val,
+        "original_query": original_query,
+        "filters": filters,
+    }
+
+# ========== LLM STREAMING (tương đương llm.py) ==========
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def _gemini_stream(prompt, temperature: float):
+    cfg = None
+    if GENAI_AVAILABLE:
+        cfg = genai.types.GenerationConfig(temperature=float(temperature))
+        return answer_model.generate_content(prompt, generation_config=cfg, stream=True)
+    else:
+        return answer_model.generate_content(prompt, stream=True)
+
+@log_time
+def stream_answer(prompt, temperature=0.2):
     t0 = time.perf_counter()
     t_first0 = time.perf_counter()
     first_token_emitted = False
     try:
-        # SỬA LỖI: Xóa cuộc gọi trùng lặp
-        resp = await _gemini_stream_async(prompt, temperature)
-        
-        # SỬA LỖI: Dùng 'async for'
-        async for ch in resp:
+        resp = _gemini_stream(prompt, temperature)
+        for ch in resp:
             if getattr(ch, "text", None):
                 if not first_token_emitted:
                     log_step("llm_first_token", thoi_gian_truoc=f"{time.perf_counter()-t_first0:.4f}")
@@ -539,100 +1026,28 @@ async def stream_answer(prompt, temperature=0.2):
     finally:
         log_step("llm_tong", thoi_gian=f"{time.perf_counter()-t0:.4f}")
 
-# ================== LẤY DỮ LIỆU QDRANT ==================
-# @log_time
-def _fetch(filters: Dict[str, Any], limit: int = 10):
-    must = []
-    mapping = {"article_no": int, "clause_no": int, "point_letter": str, "chapter_number": int}
-    for k, caster in mapping.items():
-        if k in filters and filters[k] not in (None, ""):
-            try:
-                val = caster(filters[k])
-                must.append(FieldCondition(key=k, match=MatchValue(value=val)))
-            except Exception as e:
-                app_log.warning(
-                    "Lỗi ép kiểu dữ liệu bộ lọc",
-                    extra={"__kv__": {"truong": k, "gia_tri": filters[k], "loi": str(e)}},
-                )
-                try:
-                    val = str(filters[k])
-                    must.append(FieldCondition(key=k, match=MatchValue(value=val)))
-                except:
-                    pass
-    app_log.info(
-        "Bộ lọc tìm kiếm",
-        extra={"__kv__": {"bo_loc_goc": str(filters), "dieu_kien_must": str(must)}},
-    )
-    if not must:
-        app_log.warning("Không có điều kiện must")
-        return []
-    flt = Filter(must=must)
-    out = []
-    try:
-        scroll_res, _ = client.scroll(
-            collection_name=COLLECTION_NAME,
-            scroll_filter=flt,
-            limit=min(64, max(5, limit)),
-            with_payload=True,
-        )
-        app_log.info(
-            "Kết quả tìm kiếm Qdrant",
-            extra={"__kv__": {"so_luong": len(scroll_res), "collection": COLLECTION_NAME}},
-        )
-        for r in scroll_res:
-            p = r.payload or {}
-            out.append({
-                "source_id": p.get("source_id", ""), # SỬA LỖI: Thêm source_id
-                "chapter": p.get("chapter", ""),
-                "article_no": p.get("article_no", ""),
-                "article_title": p.get("article_title", ""),
-                "clause_no": p.get("clause_no", ""),
-                "point_letter": p.get("point_letter", ""),
-                "content": (p.get("content") or "").strip(),
-                "score": 1.0,
-            })
-            if len(out) >= limit:
-                break
-    except Exception as e:
-        app_log.error(
-            "Lỗi khi tìm kiếm Qdrant",
-            extra={"__kv__": {"loi": str(e), "collection": COLLECTION_NAME}},
-        )
-        return []
-    if not out:
-        app_log.warning("Không tìm thấy kết quả", extra={"__kv__": {"bo_loc": str(filters)}})
-    return out
+# ========== UI / MAIN (tương đương file 4 + main.py) ==========
+# We'll attempt to import gradio; if missing, provide CLI fallback.
+try:
+    import gradio as gr
+    GRADIO_AVAILABLE = True
+except Exception:
+    GRADIO_AVAILABLE = False
+    app_log.warning("gradio không khả dụng — UI sẽ không chạy", extra={"__kv__": {}})
 
-# ================== HÀM HỖ TRỢ GIAO DIỆN ==================
-def ui_return(msg_val, chatbot_val, emb_val, cites_val, last_answer_val, docs_val, page_val, page_label_val, history_msgs):
-    """Helper function đảm bảo luôn trả về đúng 9 giá trị (đã xóa bm25)"""
-    print("DEBUG: Gọi hàm ui_return, trả về 9 giá trị")
-    return (
-        msg_val,
-        chatbot_val,
-        gr.update(value=emb_val),
-        gr.update(value=cites_val),
-        last_answer_val,
-        docs_val,
-        page_val,
-        page_label_val,
-        history_msgs,
-    )
-
-# ================== GIAO DIỆN NGƯỜI DÙNG ==================
 CSS = """
 #chatbot { height: 540px !important; }
 label { font-size:12px !important; opacity:.9 }
 #cites-box {
-    max-height: 480px; /* Tăng chiều cao */
+    max-height: 360px;
     overflow-y: auto;
     border: 1px solid #ddd;
     padding: 6px;
     border-radius: 6px;
     background-color: #fafafa;
 }
-#emb-box {
-    max-height: 280px; /* Tăng chiều cao */
+#bm25-box, #emb-box {
+    max-height: 200px;
     overflow-y: auto;
     border: 1px solid #ddd;
     padding: 6px;
@@ -641,171 +1056,115 @@ label { font-size:12px !important; opacity:.9 }
 }
 """
 
-with gr.Blocks(
-    title="⚖️ Trợ lý Luật Hôn Nhân & Gia Đình 2014",
-    css=CSS,
-) as demo:
-    gr.Markdown("""
-    ### ⚖️ Trợ lý Luật Hôn Nhân & gia đình 2014
-    *Tham chiếu chính xác • Hạn chế suy diễn • Không thay thế tư vấn pháp lý*
-    """)
-
-    with gr.Row():
-        with gr.Column(scale=7):
-            chatbot = gr.Chatbot(
-                value=[],
-                type="messages",
-                show_copy_button=True,
-                elem_id="chatbot",
-                autoscroll=True,
-            )
-            with gr.Row():
-                ex1 = gr.Button("Chào bạn")
-                ex2 = gr.Button("Điều 81 quy định gì về việc nuôi con sau ly hôn")
-                ex3 = gr.Button("Khoản 2 Điều 56 nói gì")
-        with gr.Column(scale=5):
-            # ĐÃ XÓA PANEL BM25
-            gr.Markdown("**📜 Kết quả tìm kiếm (Vector Search)**")
-            emb_md = gr.Markdown(value="(Chưa có dữ liệu)", elem_id="emb-box")
-            
-            gr.Markdown("**Cơ sở pháp lý (Chi tiết)**")
-            cites_md = gr.Markdown(value="(Chưa có dữ liệu)", elem_id="cites-box")
-            with gr.Row():
-                prev_page = gr.Button("⬅️")
-                next_page = gr.Button("➡️")
-            with gr.Row():
-                page_info = gr.Markdown(" Trang 0/0")
-                page_size = gr.Slider(3, 20, value=5, step=1, label="Mỗi trang")
-
-    with gr.Row():
-        msg = gr.Textbox(placeholder="Nhập câu hỏi...", scale=5, autofocus=False)
-        send = gr.Button("Gửi", variant="primary", scale=1)
-        clear = gr.Button("Làm mới", scale=1)
-
-    # Điền sẵn ví dụ
-    def _fill(text):
-        return text
-
-    ex1.click(lambda: _fill("Chào bạn"), outputs=msg)
-    ex2.click(
-        lambda: _fill("Điều 81 quy định gì về việc nuôi con sau ly hôn"),
-        outputs=msg,
+def ui_return(msg_val, chatbot_val, bm25_val, emb_val, cites_val, last_answer_val, docs_val, page_val, page_label_val, history_msgs):
+    print("DEBUG: Gọi hàm ui_return, trả về 10 giá trị")
+    return (
+        msg_val,
+        chatbot_val,
+        gr.update(value=bm25_val) if GRADIO_AVAILABLE else bm25_val,
+        gr.update(value=emb_val) if GRADIO_AVAILABLE else emb_val,
+        gr.update(value=cites_val) if GRADIO_AVAILABLE else cites_val,
+        last_answer_val,
+        docs_val,
+        page_val,
+        page_label_val,
+        history_msgs,
     )
-    ex3.click(lambda: _fill("Khoản 2 Điều 56 nói gì"), outputs=msg)
 
-    # Trạng thái
-    state_history = gr.State([])
-    state_last_answer = gr.State("")
-    state_docs = gr.State([])
-    state_page = gr.State(1)
-
-    # -------- GENERATOR CHÍNH - SỬA LỖI: Chuyển sang async def --------
-    @log_time
-    async def respond_generator(message, history_msgs, cur_page_size, k=15, temperature=0.2, threshold=0.42):
-        """Generator function - yield từng update dần dần (ĐÃ CHUYỂN SANG ASYNC)"""
-        print(f"DEBUG: Bắt đầu xử lý câu hỏi: {message}")
-        if not (message and message.strip()):
-            print("DEBUG: Câu hỏi rỗng, trả về mặc định")
+@log_time
+def respond_generator(message, history_msgs, cur_page_size, k=15, temperature=0.2, threshold=0.42):
+    print(f"DEBUG: Bắt đầu xử lý câu hỏi: {message}")
+    if not (message and message.strip()):
+        print("DEBUG: Câu hỏi rỗng, trả về mặc định")
+        if GRADIO_AVAILABLE:
             gr.Info("Vui lòng nhập câu hỏi.")
-            yield ui_return(
-                gr.update(value=""),
-                history_msgs,
-                # "", # Bỏ bm25_val
-                "",
-                "",
-                "",
-                [],
-                1,
-                " Trang 0/0",
-                history_msgs,
-            )
-            return
+        yield ui_return(
+            gr.update(value="") if GRADIO_AVAILABLE else "",
+            history_msgs,
+            "",
+            "",
+            "",
+            "",
+            [],
+            1,
+            " Trang 0/0",
+            history_msgs,
+        )
+        return
 
-        t_overall0 = time.perf_counter()
-        try:
-            # Phân tích ý định
-            print("DEBUG: Gọi hàm phân tích ý định")
-            intent_info = analyze_intent(message)
-            print(f"DEBUG: Kết quả ý định: {intent_info}")
-            intent = intent_info["intent"]
-            intent_answer = intent_info.get("answer", "")
-            normalized_query = intent_info.get("normalized_query", message)
-            original_query = intent_info.get("original_query", message)
-            intent_filters = intent_info.get("filters", {})
+    t_overall0 = time.perf_counter()
+    try:
+        print("DEBUG: Gọi hàm phân tích ý định")
+        intent_info = analyze_intent(message)
+        print(f"DEBUG: Kết quả ý định: {intent_info}")
+        intent = intent_info["intent"]
+        intent_answer = intent_info.get("answer", "")
+        normalized_query = intent_info.get("normalized_query", message)
+        original_query = intent_info.get("original_query", message)
+        intent_filters = intent_info.get("filters", {})
+        query_type = intent_info.get("query_type", "")
+        use_fetch = bool(intent_filters and any(intent_filters.get(k) not in (None, "", 0) for k in ["article_no","clause_no","point_letter","chapter_number"]))
 
-            # ========== XỬ LÝ CÂU HỎI XÃ GIAO ==========
-            if intent == "casual":
-                final_answer = (intent_answer or "").replace("\u200b", "").strip()
-                app_log.info(
-                    "Xử lý câu hỏi xã giao",
-                    extra={"__kv__": {"do_dai_tra_loi": len(final_answer)}},
-                )
-
-                if final_answer and CASUAL_MAX_WORDS > 0:
-                    words = final_answer.split()
-                    if len(words) > CASUAL_MAX_WORDS:
-                        truncated = " ".join(words[:CASUAL_MAX_WORDS])
-                        app_log.info(
-                            "Cắt ngắn câu trả lời xã giao",
-                            extra={
-                                "__kv__": {
-                                    "so_tu_goc": len(words),
-                                    "so_tu_giu": CASUAL_MAX_WORDS,
-                                    "do_dai_goc": len(final_answer),
-                                }
-                            },
-                        )
-                        final_answer = truncated
-
-                # Nếu có câu trả lời trực tiếp từ intent
-                if len(final_answer) >= 1:
-                    history_msgs = history_msgs + [
-                        {"role": "user", "content": message},
-                        {"role": "assistant", "content": final_answer},
-                    ]
-                    print("DEBUG: Trả về câu trả lời xã giao trực tiếp")
-                    yield ui_return(
-                        gr.update(value=""),
-                        history_msgs,
-                        "(Không có trích dẫn)",
-                        "(Không có trích dẫn)",
-                        final_answer,
-                        [],
-                        1,
-                        " Trang 0/0",
-                        history_msgs,
-                    )
-                    return
-
-                # Stream câu trả lời xã giao
-                simple_prompt = "Trả lời thân thiện ngắn gọn (<=2 câu) tiếng Việt cho câu: " + message
+        if intent == "casual":
+            final_answer = (intent_answer or "").replace("\u200b", "").strip()
+            app_log.info("Xử lý câu hỏi xã giao", extra={"__kv__": {"do_dai_tra_loi": len(final_answer)}})
+            if final_answer and CASUAL_MAX_WORDS > 0:
+                words = final_answer.split()
+                if len(words) > CASUAL_MAX_WORDS:
+                    truncated = " ".join(words[:CASUAL_MAX_WORDS])
+                    app_log.info("Cắt ngắn câu trả lời xã giao", extra={"__kv__": {"so_tu_goc": len(words), "so_tu_giu": CASUAL_MAX_WORDS, "do_dai_goc": len(final_answer)}})
+                    final_answer = truncated
+            if len(final_answer) >= 1:
                 history_msgs = history_msgs + [
                     {"role": "user", "content": message},
-                    {"role": "assistant", "content": ""},
+                    {"role": "assistant", "content": final_answer},
                 ]
-                acc = ""
-                print("DEBUG: Bắt đầu stream câu trả lời xã giao")
-                
-                # Yield initial state
+                print("DEBUG: Trả về câu trả lời xã giao trực tiếp")
                 yield ui_return(
-                    gr.update(value=""),
+                    gr.update(value="") if GRADIO_AVAILABLE else "",
                     history_msgs,
                     "(Không có trích dẫn)",
                     "(Không có trích dẫn)",
-                    acc,
+                    "(Không có trích dẫn)",
+                    final_answer,
                     [],
                     1,
                     " Trang 0/0",
                     history_msgs,
                 )
-                
-                # Stream từng chunk - SỬA LỖI: dùng async for và bỏ buffer
-                async for chunk in stream_answer(simple_prompt, temperature=float(temperature)):
-                    acc += chunk
+                return
+
+            simple_prompt = "Trả lời thân thiện ngắn gọn (<=2 câu) tiếng Việt cho câu: " + message
+            history_msgs = history_msgs + [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": ""},
+            ]
+            acc = ""
+            print("DEBUG: Bắt đầu stream câu trả lời xã giao")
+
+            yield ui_return(
+                gr.update(value="") if GRADIO_AVAILABLE else "",
+                history_msgs,
+                "(Không có trích dẫn)",
+                "(Không có trích dẫn)",
+                "(Không có trích dẫn)",
+                acc,
+                [],
+                1,
+                " Trang 0/0",
+                history_msgs,
+            )
+
+            buffer = ""
+            for chunk in stream_answer(simple_prompt, temperature=float(temperature)):
+                buffer += chunk
+                if len(buffer) >= 50:
+                    acc += buffer
                     history_msgs[-1]["content"] = acc
                     yield ui_return(
-                        gr.update(value=""),
+                        gr.update(value="") if GRADIO_AVAILABLE else "",
                         history_msgs,
+                        "(Không có trích dẫn)",
                         "(Không có trích dẫn)",
                         "(Không có trích dẫn)",
                         acc,
@@ -814,125 +1173,153 @@ with gr.Blocks(
                         " Trang 0/0",
                         history_msgs,
                     )
-
-                print("DEBUG: Hoàn thành stream câu trả lời xã giao")
-                return
-
-            # ========== XỬ LÝ CÂU HỎI PHÁP LÝ ==========
-            docs: List[Dict[str, Any]] = []
-            source = None
-
-            if intent == "law_search":
-                print("DEBUG: Tìm kiếm điều luật")
-                docs = _fetch(intent_filters, limit=int(k)) if intent_filters else []
-                source = "law_search_fetch"
-                if not docs:
-                    app_log.info(
-                        "Rơi vào tìm kiếm vector (fallback)",
-                        extra={"__kv__": {"cau_hoi": message}},
-                    )
-                    # SỬA LỖI: Dùng await trực tiếp
-                    docs = await search_law(
-                        message, top_k=int(k), score_threshold=float(threshold)
-                    )
-                    source = "law_search_vector_fallback"
-
-            elif intent == "legal_answer":
-                print("DEBUG: Tìm kiếm câu trả lời pháp lý (vector search)")
-                # SỬA LỖI: Dùng await trực tiếp
-                docs = await search_law(
-                    normalized_query, top_k=int(k), score_threshold=float(threshold)
-                )
-                source = "legal_answer_vector"
-
-            else:
-                reply = INTENT_FALLBACK_CASUAL
-                history_msgs = history_msgs + [
-                    {"role": "user", "content": message},
-                    {"role": "assistant", "content": reply},
-                ]
-                print("DEBUG: Trả về ý định mặc định")
-                yield ui_return(
-                    gr.update(value=""),
-                    history_msgs,
-                    "(Không có trích dẫn)",
-                    "(Không có trích dẫn)",
-                    reply,
-                    [],
-                    1,
-                    " Trang 0/0",
-                    history_msgs,
-                )
-                return
-
-            if not docs:
-                reply = (
-                    "Chưa tìm thấy cơ sở pháp lý phù hợp. "
-                    "Bạn có thể bổ sung Điều/Khoản hoặc thêm bối cảnh."
-                )
-                upd = history_msgs + [
-                    {"role": "user", "content": message},
-                    {"role": "assistant", "content": reply},
-                ]
-                print("DEBUG: Không tìm thấy tài liệu")
-                yield ui_return(
-                    gr.update(value=""),
-                    upd,
-                    "(Chưa có dữ liệu)",
-                    "(Chưa có dữ liệu)",
-                    reply,
-                    [],
-                    1,
-                    " Trang 0/0",
-                    upd,
-                )
-                return
-
-            # Chuẩn bị prompt và markdown
-            if intent == "legal_answer":
-                user_query = original_query or message
-            elif intent == "law_search":
-                user_query = message
-            else:
-                user_query = message
-            
-            # ĐÃ XÓA bm25_markdown
-            emb_markdown = docs_to_markdown(docs) # emb_md giờ là docs chính
-            cites_markdown, page_label = docs_page_markdown(docs, 1, int(cur_page_size))
-            prompt = build_prompt(user_query, docs, history_msgs)
-
-            log_step("llm_chuanbi", so_tai_lieu=len(docs), nguon=source)
-            print(f"DEBUG: Đã chuẩn bị prompt, số tài liệu: {len(docs)}")
-
-            # Chuẩn bị history
-            history_msgs = history_msgs + [
-                {"role": "user", "content": message},
-                {"role": "assistant", "content": ""},
-            ]
-            acc = ""
-            
-            print("DEBUG: Bắt đầu stream câu trả lời pháp lý")
-            
-            # Yield initial state với các markdown
-            yield ui_return(
-                gr.update(value=""),
-                history_msgs,
-                emb_markdown, # Hiển thị docs lên panel emb
-                cites_markdown,
-                acc,
-                docs,
-                1,
-                page_label,
-                history_msgs,
-            )
-            
-            # Stream từng chunk - SỬA LỖI: dùng async for và bỏ buffer
-            async for chunk in stream_answer(prompt, temperature=float(temperature)):
-                acc += chunk
+                    buffer = ""
+            if buffer:
+                acc += buffer
                 history_msgs[-1]["content"] = acc
                 yield ui_return(
-                    gr.update(value=""),
+                    gr.update(value="") if GRADIO_AVAILABLE else "",
                     history_msgs,
+                    "(Không có trích dẫn)",
+                    "(Không có trích dẫn)",
+                    "(Không có trích dẫn)",
+                    acc,
+                    [],
+                    1,
+                    " Trang 0/0",
+                    history_msgs,
+                )
+            print("DEBUG: Hoàn thành stream câu trả lời xã giao")
+            return
+
+        docs = []
+        bm25_docs = []
+        emb_docs = []
+        source = None
+
+        if intent == "law_search":
+            print(f"DEBUG: Law search với query_type={query_type}, use_fetch={use_fetch}")
+            if use_fetch:
+                app_log.info("🎯 LAW_SEARCH: Sử dụng FETCH", extra={"__kv__": {"query_type": query_type, "filters": str(intent_filters), "method": "fetch"}})
+                log_step("law_search_method", method="fetch", query_type=query_type, has_filters=True)
+                docs = _fetch(intent_filters, limit=int(k))
+                source = "law_search_fetch"
+            else:
+                app_log.info("🔍 LAW_SEARCH: Sử dụng RAG", extra={"__kv__": {"query": message[:80], "query_type": query_type, "method": "rag_search"}})
+                log_step("law_search_method", method="rag_search", query_type=query_type, has_filters=False)
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    bm25_docs, emb_docs, docs = loop.run_until_complete(search_law(message, top_k=int(k), score_threshold=float(threshold)))
+                finally:
+                    loop.close()
+                source = f"law_search_rag_{query_type}"
+            if not docs and use_fetch:
+                app_log.info("Không tìm thấy docs từ fetch, fallback sang embedding search", extra={"__kv__": {"cau_hoi": message}})
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    bm25_docs, emb_docs, docs = loop.run_until_complete(search_law(message, top_k=int(k), score_threshold=float(threshold)))
+                finally:
+                    loop.close()
+                source = "law_search_fallback"
+
+        elif intent == "legal_answer":
+            print("DEBUG: Tìm kiếm câu trả lời pháp lý")
+            try:
+                normalized_query = rewrite_query(normalized_query)
+            except Exception:
+                pass
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                bm25_docs, emb_docs, docs = loop.run_until_complete(search_law(normalized_query, top_k=int(k), score_threshold=float(threshold)))
+            finally:
+                loop.close()
+            source = "legal_answer"
+        else:
+            reply = INTENT_FALLBACK_CASUAL
+            history_msgs = history_msgs + [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": reply},
+            ]
+            print("DEBUG: Trả về ý định mặc định")
+            yield ui_return(
+                gr.update(value="") if GRADIO_AVAILABLE else "",
+                history_msgs,
+                "(Không có trích dẫn)",
+                "(Không có trích dẫn)",
+                "(Không có trích dẫn)",
+                reply,
+                [],
+                1,
+                " Trang 0/0",
+                history_msgs,
+            )
+            return
+
+        if not docs:
+            reply = "Chưa tìm thấy cơ sở pháp lý phù hợp. Bạn có thể bổ sung Điều/Khoản hoặc thêm bối cảnh."
+            upd = history_msgs + [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": reply},
+            ]
+            print("DEBUG: Không tìm thấy tài liệu")
+            yield ui_return(
+                gr.update(value="") if GRADIO_AVAILABLE else "",
+                upd,
+                "(Chưa có dữ liệu)",
+                "(Chưa có dữ liệu)",
+                "(Chưa có dữ liệu)",
+                reply,
+                [],
+                1,
+                " Trang 0/0",
+                upd,
+            )
+            return
+
+        if intent == "legal_answer":
+            user_query = original_query or message
+        elif intent == "law_search":
+            user_query = message
+        else:
+            user_query = message
+
+        bm25_markdown = docs_to_markdown(bm25_docs)
+        emb_markdown = docs_to_markdown(emb_docs)
+        cites_markdown, page_label = docs_page_markdown(docs, 1, int(cur_page_size))
+        prompt = build_prompt(user_query, docs, history_msgs)
+        log_step("llm_chuanbi", so_tai_lieu=len(docs), nguon=source)
+        print(f"DEBUG: Đã chuẩn bị prompt, số tài liệu: {len(docs)}")
+        history_msgs = history_msgs + [
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": ""},
+        ]
+        acc = ""
+        print("DEBUG: Bắt đầu stream câu trả lời pháp lý")
+        yield ui_return(
+            gr.update(value="") if GRADIO_AVAILABLE else "",
+            history_msgs,
+            bm25_markdown,
+            emb_markdown,
+            cites_markdown,
+            acc,
+            docs,
+            1,
+            page_label,
+            history_msgs,
+        )
+        buffer = ""
+        for chunk in stream_answer(prompt, temperature=float(temperature)):
+            buffer += chunk
+            if len(buffer) >= 50:
+                acc += buffer
+                history_msgs[-1]["content"] = acc
+                yield ui_return(
+                    gr.update(value="") if GRADIO_AVAILABLE else "",
+                    history_msgs,
+                    bm25_markdown,
                     emb_markdown,
                     cites_markdown,
                     acc,
@@ -941,106 +1328,142 @@ with gr.Blocks(
                     page_label,
                     history_msgs,
                 )
-
-            print("DEBUG: Hoàn thành stream câu trả lời pháp lý")
-            return
-
-        except Exception as e:
-            app_log.error("Lỗi xử lý câu hỏi", extra={"__kv__": {"loi": str(e)}})
-            print(f"DEBUG: Lỗi trong xử lý: {e}")
+                buffer = ""
+        if buffer:
+            acc += buffer
+            history_msgs[-1]["content"] = acc
             yield ui_return(
-                gr.update(value=""),
+                gr.update(value="") if GRADIO_AVAILABLE else "",
                 history_msgs,
-                "(Lỗi hệ thống)",
-                "(Lỗi hệ thống)",
-                f"Lỗi: {e}",
-                [],
+                bm25_markdown,
+                emb_markdown,
+                cites_markdown,
+                acc,
+                docs,
                 1,
-                " Trang 0/0",
+                page_label,
                 history_msgs,
             )
-            return
+        print("DEBUG: Hoàn thành stream câu trả lời pháp lý")
+        return
 
-    # -------- WRAPPER BẤT ĐỒNG BỘ - Gradio gọi hàm này --------
-    async def respond_wrapper(message, history_msgs, cur_page_size, k=15, temperature=0.2, threshold=0.42):
-        """SỬA LỖI: Wrapper async để Gradio gọi"""
-        async for output in respond_generator(message, history_msgs, cur_page_size, k, temperature, threshold):
-            yield output
-
-    # Kết nối outputs (9 giá trị, đã xóa bm25_md)
-    outputs = [
-        msg,                  # 1
-        chatbot,              # 2
-        emb_md,               # 3
-        cites_md,             # 4
-        state_last_answer,    # 5
-        state_docs,           # 6
-        state_page,           # 7
-        page_info,            # 8
-        state_history,        # 9
-    ]
-    
-    # Kết nối với wrapper (BẬT queue=True để hỗ trợ streaming)
-    send.click(respond_wrapper, inputs=[msg, state_history, page_size], outputs=outputs, queue=True)
-    msg.submit(respond_wrapper, inputs=[msg, state_history, page_size], outputs=outputs, queue=True)
-
-    # Nút Làm mới
-    def clear_all():
-        return (
-            "",                     # msg
-            [],                     # chatbot
-            "(Chưa có dữ liệu)",    # emb_md
-            "(Chưa có dữ liệu)",    # cites_md
-            "",                     # state_last_answer
-            [],                     # state_docs
-            1,                      # state_page
-            " Trang 0/0",           # page_info
-            []                      # state_history
+    except Exception as e:
+        app_log.error("Lỗi xử lý câu hỏi", extra={"__kv__": {"loi": str(e)}})
+        print(f"DEBUG: Lỗi trong xử lý: {e}")
+        yield ui_return(
+            gr.update(value="") if GRADIO_AVAILABLE else "",
+            history_msgs,
+            "(Lỗi hệ thống)",
+            "(Lỗi hệ thống)",
+            "(Lỗi hệ thống)",
+            f"Lỗi: {e}",
+            [],
+            1,
+            " Trang 0/0",
+            history_msgs,
         )
-    clear.click(clear_all, outputs=outputs, queue=False)
+        return
 
-    # Like/Dislike
-    def on_like(data: gr.LikeData):
-        msg_like = data.value or {}
-        role = msg_like.get("role", "assistant")
-        text = msg_like.get("content", "")
-        app_log.info(
-            "Phản hồi người dùng",
-            extra={"__kv__": {"thich": data.liked, "vai_tro": role, "do_dai": len(text or "")}},
-        )
-        return None
-    chatbot.like(on_like)
+def respond_wrapper(message, history_msgs, cur_page_size, k=15, temperature=0.2, threshold=0.42):
+    for output in respond_generator(message, history_msgs, cur_page_size, k, temperature, threshold):
+        yield output
 
-    # Phân trang
-    def render_cites_for_page(docs, page, cur_page_size):
-        md, label = docs_page_markdown(docs or [], int(page), int(cur_page_size))
-        return gr.update(value=md), int(page), label
+def build_ui():
+    if not GRADIO_AVAILABLE:
+        raise RuntimeError("gradio không cài đặt; không thể build UI.")
+    with gr.Blocks(title="⚖️ Trợ lý Luật Hôn Nhân & Gia Đình 2014", css=CSS) as demo:
+        gr.Markdown("""
+        ### ⚖️ Trợ lý Luật Hôn Nhân & Gia đình 2014
+        *Tham chiếu chính xác • Hạn chế suy diễn • Không thay thế tư vấn pháp lý*
+        """)
+        with gr.Row():
+            with gr.Column(scale=7):
+                chatbot = gr.Chatbot(value=[], type="messages", show_copy_button=True, elem_id="chatbot", autoscroll=True)
+                with gr.Row():
+                    ex1 = gr.Button("Chào bạn")
+                    ex2 = gr.Button("Điều 81 quy định gì về việc nuôi con sau ly hôn")
+                    ex3 = gr.Button("Khoản 2 Điều 56 nói gì")
+            with gr.Column(scale=5):
+                gr.Markdown("**📜 Kết quả BM25**")
+                bm25_md = gr.Markdown(value="(Chưa có dữ liệu)", elem_id="bm25-box")
+                gr.Markdown("**📜 Kết quả Embedding Search**")
+                emb_md = gr.Markdown(value="(Chưa có dữ liệu)", elem_id="emb-box")
+                gr.Markdown("**Cơ sở pháp lý**")
+                cites_md = gr.Markdown(value="(Chưa có dữ liệu)", elem_id="cites-box")
+                with gr.Row():
+                    prev_page = gr.Button("⬅️")
+                    next_page = gr.Button("➡️")
+                with gr.Row():
+                    page_info = gr.Markdown(" Trang 0/0")
+                    page_size = gr.Slider(3, 20, value=5, step=1, label="Mỗi trang")
+        with gr.Row():
+            msg = gr.Textbox(placeholder="Nhập câu hỏi...", scale=5, autofocus=False)
+            send = gr.Button("Gửi", variant="primary", scale=1)
+            clear = gr.Button("Làm mới", scale=1)
+        def _fill(text):
+            return text
+        ex1.click(lambda: _fill("Chào bạn"), outputs=msg)
+        ex2.click(lambda: _fill("Điều 81 quy định gì về việc nuôi con sau ly hôn"), outputs=msg)
+        ex3.click(lambda: _fill("Khoản 2 Điều 56 nói gì"), outputs=msg)
+        state_history = gr.State([])
+        state_last_answer = gr.State("")
+        state_docs = gr.State([])
+        state_page = gr.State(1)
+        outputs = [msg, chatbot, bm25_md, emb_md, cites_md, state_last_answer, state_docs, state_page, page_info, state_history]
+        send.click(respond_wrapper, inputs=[msg, state_history, page_size], outputs=outputs, queue=True)
+        msg.submit(respond_wrapper, inputs=[msg, state_history, page_size], outputs=outputs, queue=True)
+        def on_like(data: gr.LikeData):
+            msg_like = data.value or {}
+            role = msg_like.get("role", "assistant")
+            text = msg_like.get("content", "")
+            app_log.info("Phản hồi người dùng", extra={"__kv__": {"thich": data.liked, "vai_tro": role, "do_dai": len(text or "")}})
+            return None
+        chatbot.like(on_like)
+        def render_cites_for_page(docs, page, cur_page_size):
+            md, label = docs_page_markdown(docs or [], int(page), int(cur_page_size))
+            return gr.update(value=md), int(page), label
+        def go_prev(docs, page, cur_page_size):
+            if not docs:
+                return render_cites_for_page([], 1, cur_page_size)
+            new_page = max(1, int(page) - 1)
+            return render_cites_for_page(docs, new_page, cur_page_size)
+        def go_next(docs, page, cur_page_size):
+            if not docs:
+                return render_cites_for_page([], 1, cur_page_size)
+            _, total, total_pages, _ = paginate_docs(docs, 1, int(cur_page_size))
+            new_page = min(total_pages if total_pages > 0 else 1, int(page) + 1)
+            return render_cites_for_page(docs, new_page, cur_page_size)
+        def on_change_page_size(docs, cur_page_size):
+            return render_cites_for_page(docs, 1, cur_page_size)
+        prev_page.click(go_prev, inputs=[state_docs, state_page, page_size], outputs=[cites_md, state_page, page_info], queue=False)
+        next_page.click(go_next, inputs=[state_docs, state_page, page_size], outputs=[cites_md, state_page, page_info], queue=False)
+        page_size.release(on_change_page_size, inputs=[state_docs, page_size], outputs=[cites_md, state_page, page_info], queue=False)
+        gr.Markdown(f"<sub>© {datetime.now().year} — Nội dung chỉ mang tính tham khảo, không thay thế tư vấn pháp lý chính thức.</sub>")
+    return demo
 
-    def go_prev(docs, page, cur_page_size):
-        if not docs:
-            return render_cites_for_page([], 1, cur_page_size)
-        new_page = max(1, int(page) - 1)
-        return render_cites_for_page(docs, new_page, cur_page_size)
-
-    def go_next(docs, page, cur_page_size):
-        if not docs:
-            return render_cites_for_page([], 1, cur_page_size)
-        _, total, total_pages, _ = paginate_docs(docs, 1, int(cur_page_size))
-        new_page = min(total_pages if total_pages > 0 else 1, int(page) + 1)
-        return render_cites_for_page(docs, new_page, cur_page_size)
-
-    def on_change_page_size(docs, cur_page_size):
-        return render_cites_for_page(docs, 1, cur_page_size)
-
-    prev_page.click(go_prev, inputs=[state_docs, state_page, page_size], outputs=[cites_md, state_page, page_info], queue=False)
-    next_page.click(go_next, inputs=[state_docs, state_page, page_size], outputs=[cites_md, state_page, page_info], queue=False)
-    page_size.release(on_change_page_size, inputs=[state_docs, page_size], outputs=[cites_md, state_page, page_info], queue=False)
-
-    gr.Markdown(f"""
-    <sub>© {datetime.now().year} — Nội dung chỉ mang tính tham khảo, không thay thế tư vấn pháp lý chính thức.</sub>
-    """)
-
+# ========== MAIN ENTRYPOINT ==========
 if __name__ == "__main__":
-    demo.queue()
-    # Bạn có thể chạy demo.launch() với share=True nếu cần
-    demo.launch(show_error=True)
+    RUN_UI = os.getenv("RUN_UI", "1").strip() not in {"0", "false", "no"}
+    if RUN_UI and GRADIO_AVAILABLE:
+        demo = build_ui()
+        demo.queue()
+        demo.launch(show_error=True, share=False)
+    else:
+        print("Chạy ở chế độ CLI (không chạy Gradio UI). Gõ câu hỏi để thử (Ctrl+C để thoát).")
+        history = []
+        try:
+            while True:
+                q = input("Bạn: ").strip()
+                if not q:
+                    continue
+                outputs = []
+                for out in respond_generator(q, history, cur_page_size=5):
+                    # out is tuple from ui_return
+                    msg_val, chat_val, bm25_val, emb_val, cites_val, last_answer_val, docs_val, page_val, page_label_val, history_msgs = out
+                    # print streaming assistant content when available
+                    if last_answer_val:
+                        print("\n--- Trợ lý đang trả lời ---")
+                        print(last_answer_val)
+                # loop ends for this question
+        except KeyboardInterrupt:
+            print("\nThoát. ")

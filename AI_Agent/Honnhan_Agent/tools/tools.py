@@ -1,16 +1,10 @@
 import re
 import torch
 from typing import List
-from rank_bm25 import BM25Okapi
 from qdrant_client.http.models import Filter, FieldCondition, MatchValue
 
-from core.config import EMBEDDING_MODEL
 from models.models import rerank_model, rerank_tokenizer
 from utils.utils import _safe_truncate
-
-from memory.cache import embed_cache, search_cache
-
-from models.models import embedder
 
 def rerank_with_baai(query, docs, top_k=15):
     if not docs:
@@ -39,27 +33,31 @@ def rerank_with_baai(query, docs, top_k=15):
 def tokenize(text):
     return re.findall(r'\w+', text.lower())
 
-def encode_query(text: str):
-    key = f"{EMBEDDING_MODEL}|query|{text}"
-    v = embed_cache.get(key)
-    if v is not None:
-        return v
-    vec = embedder.encode([f"query: {text}"], normalize_embeddings=True)[0].tolist()
-    embed_cache.set(key, vec)
-    return vec
-
 def _build_filter(query_text: str) -> Filter or None:
+    """
+    Build Qdrant filter từ query text.
+    Sử dụng metadata.* path cho các trường nested.
+    """
     conds: List[FieldCondition] = []
+    
+    # Tìm Điều
     m = re.search(r"(?i)\bđiều\s*(\d+)\b", query_text)
     if m:
-        conds.append(FieldCondition(key="article_no", match=MatchValue(value=int(m.group(1)))))
+        conds.append(FieldCondition(key="metadata.article_no", match=MatchValue(value=int(m.group(1)))))
+    
+    # Tìm Khoản
     m = re.search(r"(?i)\bkhoản\s*(\d+)\b", query_text)
     if m:
-        conds.append(FieldCondition(key="clause_no", match=MatchValue(value=int(m.group(1)))))
+        conds.append(FieldCondition(key="metadata.clause_no", match=MatchValue(value=int(m.group(1)))))
+    
+    # Tìm Điểm
     m = re.search(r"(?i)\bđiểm\s*([a-z])\b", query_text)
     if m:
-        conds.append(FieldCondition(key="point_letter", match=MatchValue(value=m.group(1).lower())))
+        conds.append(FieldCondition(key="metadata.point_letter", match=MatchValue(value=m.group(1).lower())))
+    
+    # Tìm Chương
     m = re.search(r"(?i)\bchương\s*(\d+)\b", query_text)
     if m:
-        conds.append(FieldCondition(key="chapter_number", match=MatchValue(value=int(m.group(1)))))
+        conds.append(FieldCondition(key="metadata.chapter_number", match=MatchValue(value=int(m.group(1)))))
+    
     return Filter(must=conds) if conds else None

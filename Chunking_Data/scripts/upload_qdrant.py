@@ -55,6 +55,8 @@ EXAMPLES:
       --chunk-file data/BDS.json \\
       --category BDS \\
       --dry-run
+<<<<<<< HEAD
+=======
 
   # Dense + Sparse hybrid (keyword + semantic)
   python -m Chunking_Data.scripts.upload_qdrant \\
@@ -79,22 +81,31 @@ EXAMPLES:
       --chunk-file data/BDS.json \\
       --category BDS \\
       --sparse-only
+>>>>>>> 985580bf68add13b2bc7f26f77585e9417bff953
         """
     )
     
     # Required arguments
     parser.add_argument(
         "--chunk-file",
+<<<<<<< HEAD
+        required=True,
+=======
         # required=True,
         default="data/luat_hon_nhan_gia_dinh_2014_chunk_180412_241025.json",
         
+>>>>>>> 985580bf68add13b2bc7f26f77585e9417bff953
         help="Path to chunk JSON file"
     )
     
     parser.add_argument(
         "--category",
+<<<<<<< HEAD
+        required=True,
+=======
         # required=True,
         default="QDS",
+>>>>>>> 985580bf68add13b2bc7f26f77585e9417bff953
         help="Category name for collection (e.g., BDS, QDS)"
     )
 
@@ -106,6 +117,10 @@ EXAMPLES:
     # Model options
     parser.add_argument(
         "--model",
+<<<<<<< HEAD
+        default="minhquan6203/paraphrase-vietnamese-law",
+        help="Embedding model name (default: minhquan6203/paraphrase-vietnamese-law)"
+=======
         default="BAAI/bge-m3",
         help="Embedding model name"
     )
@@ -141,6 +156,7 @@ EXAMPLES:
         "--hybrid",
         action="store_true",
         help="Tạo tất cả 3 loại embeddings (dense + sparse + colbert) - DEFAULT"
+>>>>>>> 985580bf68add13b2bc7f26f77585e9417bff953
     )
     
     parser.add_argument(
@@ -184,6 +200,9 @@ EXAMPLES:
     )
     
     args = parser.parse_args()
+<<<<<<< HEAD
+    
+=======
 
     # Sanitize collection name if provided
     if args.collection_name:
@@ -223,6 +242,7 @@ EXAMPLES:
             # Default to dense only if no hybrid option
             vector_config['dense'] = True
 
+>>>>>>> 985580bf68add13b2bc7f26f77585e9417bff953
     # Fix: --force-recreate override --append
     if args.force_recreate:
         args.append = False
@@ -237,6 +257,8 @@ EXAMPLES:
         print(f"📋 Collection: {args.collection_name} (custom, sanitized)")
     print(f"⚙️  Device: {args.device}")
     print(f"📦 Batch size: {args.batch_size}")
+<<<<<<< HEAD
+=======
 
     # Show vector types
     vector_types = []
@@ -255,6 +277,7 @@ EXAMPLES:
         print(f"🔄 Pipeline: HYBRID")
     else:
         print(f"🔄 Pipeline: STANDARD")
+>>>>>>> 985580bf68add13b2bc7f26f77585e9417bff953
     
     if args.force_recreate:
         print(f"⚠️  FORCE RECREATE MODE - Will DELETE existing data!")
@@ -282,6 +305,14 @@ EXAMPLES:
             return
         
         # 2. Create pipeline
+<<<<<<< HEAD
+        pipeline = EmbeddingPipeline(
+            model_name=args.model,
+            device=args.device,
+            batch_size=args.batch_size,
+            verbose=args.verbose
+        )
+=======
         if use_hybrid:
             from ..pipeline.hybrid_embedding_pipeline import HybridEmbeddingPipeline
             pipeline = HybridEmbeddingPipeline(
@@ -298,6 +329,7 @@ EXAMPLES:
                 batch_size=args.batch_size,
                 verbose=args.verbose
             )
+>>>>>>> 985580bf68add13b2bc7f26f77585e9417bff953
         
         # 3. Process and upload
         results = pipeline.process_and_upload(
@@ -313,6 +345,10 @@ EXAMPLES:
         print(f"{'='*80}")
         print(f"✅ Collection: {results['collection_name']}")
         print(f"✅ Total vectors: {results['total_vectors']}")
+<<<<<<< HEAD
+        print(f"✅ Dimension: {results['vector_dimension']}")
+        print(f"✅ Model: {results['model_name']}")
+=======
 
         if use_hybrid:
             # Hybrid pipeline results
@@ -328,6 +364,7 @@ EXAMPLES:
                 print(f"✅ Model: {results.get('model_name', 'N/A')}")
             else:
                 print(f"✅ Results keys: {list(results.keys())}")  # Debug
+>>>>>>> 985580bf68add13b2bc7f26f77585e9417bff953
         
     except Exception as e:
         print(f"\n❌ ERROR: {e}")

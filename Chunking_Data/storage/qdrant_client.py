@@ -7,6 +7,11 @@ Qdrant Client Module
 Module tương tác với Qdrant vector database.
 
 Functions:
+  - get_qdrant_client(): Kết nối Qdrant
+  - ensure_collection(): Tạo collection mới
+  - ensure_or_append_collection(): Create hoặc append
+  - upsert_embeddings_to_qdrant(): Upload vectors
+=======
   - business_id_to_uuid(): Convert business ID thành UUID deterministic
   - get_qdrant_client(): Kết nối Qdrant
   - ensure_collection(): Tạo collection mới (single vector)
@@ -15,6 +20,7 @@ Functions:
   - ensure_hybrid_collection(): Tạo hybrid collection (multi-vector)
   - ensure_or_append_hybrid_collection(): Create hoặc append hybrid collection
   - upsert_hybrid_embeddings_to_qdrant(): Upload hybrid multi-vectors (UUID từ business ID)
+>>>>>>> 985580bf68add13b2bc7f26f77585e9417bff953
   - count_collection_points(): Đếm số vectors
   - encode_texts(): Encode texts thành embeddings
   - get_embedding_dimension(): Get vector dimension
@@ -31,6 +37,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from qdrant_client import QdrantClient
+from qdrant_client.http.models import Distance, VectorParams, PointStruct, PayloadSchemaType
 from qdrant_client.http.models import (
     Distance, VectorParams, PointStruct, PayloadSchemaType,
     SparseVectorParams, SparseVector, MultiVectorConfig,
@@ -59,6 +66,7 @@ def business_id_to_uuid(business_id: str) -> str:
     # Sử dụng namespace DNS để tạo UUID deterministic
     namespace = uuid.NAMESPACE_DNS
     return str(uuid.uuid5(namespace, business_id))
+>>>>>>> 985580bf68add13b2bc7f26f77585e9417bff953
 
 
 # ==================== CONNECTION ====================
@@ -232,6 +240,7 @@ def ensure_or_append_collection(
         print(f"➕ Creating new collection: {collection_name}")
         ensure_collection(client, collection_name, vector_size)
         return True
+
 
 
 def ensure_hybrid_collection(
@@ -418,19 +427,28 @@ def upsert_embeddings_to_qdrant(
 ) -> None:
     """
     Upload embeddings và chunks lên Qdrant.
+<<<<<<< HEAD
+    
+=======
 
     Convert business ID từ doc["id"] thành UUID để làm point ID.
     UUID được tạo deterministic từ business ID để đảm bảo consistency.
+
 
     Args:
         client: QdrantClient instance
         collection_name: Tên collection
         embeddings: Numpy array shape (n_docs, vector_dim)
+
+        law_docs: List chunks với metadata
+        batch_size: Batch size cho upload
+
         law_docs: List chunks với metadata (phải có field "id")
         batch_size: Batch size cho upload
 
     Raises:
         ValueError: Nếu document thiếu field "id" hoặc business ID invalid
+
     """
     if len(embeddings) != len(law_docs):
         raise ValueError(
@@ -438,6 +456,24 @@ def upsert_embeddings_to_qdrant(
         )
     
     print(f"📤 Uploading {len(law_docs)} vectors in batches of {batch_size}...")
+
+    
+    # Get current max ID để tránh conflict
+    try:
+        existing_count = count_collection_points(client, collection_name)
+        start_id = existing_count
+    except Exception:
+        start_id = 0
+    
+    # Batch upload
+    for i in tqdm(range(0, len(law_docs), batch_size), desc="Uploading"):
+        batch_docs = law_docs[i:i + batch_size]
+        batch_embeddings = embeddings[i:i + batch_size]
+        
+        points = []
+        for j, (doc, embedding) in enumerate(zip(batch_docs, batch_embeddings)):
+            point_id = start_id + i + j
+
 
     # Validate business IDs và convert to UUID
     for doc in law_docs:
@@ -474,6 +510,7 @@ def upsert_embeddings_to_qdrant(
         )
     
     print(f"   ✅ Uploaded {len(law_docs)} vectors")
+
 
 
 def upsert_hybrid_embeddings_to_qdrant(
@@ -565,6 +602,7 @@ def upsert_hybrid_embeddings_to_qdrant(
         )
 
     print(f"   ✅ Uploaded {len(law_docs)} hybrid vectors")
+
 
 
 # ==================== EMBEDDING ====================
