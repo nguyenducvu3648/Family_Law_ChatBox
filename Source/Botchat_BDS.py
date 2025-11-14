@@ -212,7 +212,8 @@ Nhiệm vụ: Phân tích câu hỏi và quyết định phương thức truy v�
 === YÊU CẦU ===
 - Trả về JSON thuần (KHÔNG markdown, KHÔNG ```json)
 - search_query: LUÔN là câu hỏi đã được mở rộng, chi tiết hóa
-- Nếu không chắc chắn về filters → dùng "rag_search" thay vì "fetch"
+- QUAN TRỌNG: Chỉ điền "filters" khi câu hỏi CÓ CHỨA SỐ CỤ THỂ (ví dụ: "Điều 5", "Khoản 1").
+- Nếu câu hỏi chung chung (ví dụ: "Quy trình bán đất", "Thủ tục làm sổ đỏ"), hãy để "filters": {} (RỖNG).
 
 === SCHEMA ===
 {
@@ -356,57 +357,171 @@ def _fetch(filters: Dict[str, Any], limit: int = 10) -> List[Dict]:
 # =========================
 # RAG SEARCH
 # =========================
-@log_time
-async def search_law(original_query: str, normalized_query: str, top_k: int = 10, score_threshold: float = -100.0):  # FIX: Very low threshold to keep all
-    """Hybrid search: Dense + Sparse + ColBERT + BAAI rerank với Multi-Query Ensemble"""
-    app_log.info(f"RAG search ensemble: original={_safe_truncate(original_query, 80)}, normalized={_safe_truncate(normalized_query, 80)}")
+
+# ===== OLD FLOW (COMMENTED OUT - Collection lỗi) =====
+# @log_time
+# async def search_law_old(original_query: str, normalized_query: str, top_k: int = 10):
+#     """Hybrid search: Dense + Sparse + ColBERT + BAAI rerank với Multi-Query Ensemble"""
+#     app_log.info(f"RAG search ensemble: original={_safe_truncate(original_query, 80)}, normalized={_safe_truncate(normalized_query, 80)}")
+#     
+#     cache_key = f"search|{COLLECTION_NAME}|{top_k}|{original_query}|{normalized_query}"
+#     cached = search_cache.get(cache_key)
+#     if cached is not None:
+#         app_log.info("Cache hit ✅")
+#         return [], [], cached
+#     
+#     try:
+#         # Hàm helper để chạy hybrid search cho một query
+#         async def hybrid_for_query(q: str) -> List[Dict]:
+#             # Embeddings
+#             dense_vectors = dense_embedding_model.encode(q).tolist()  # Ensure list[float]
+#             sparse_vectors = next(sparse_embedding_model.query_embed(q))
+#             late_vectors = next(late_interaction_embedding_model.query_embed(q))
+#             
+#             # Hybrid search với ColBERT
+#             from qdrant_client import models
+#             prefetch = [
+#                 models.Prefetch(query=dense_vectors, using="bge-m3", limit=20),
+#                 models.Prefetch(
+#                     query=models.SparseVector(
+#                         indices=sparse_vectors.indices.tolist(),
+#                         values=sparse_vectors.values.tolist(),
+#                     ),
+#                     using="bm25",
+#                     limit=10
+#                 )
+#             ]
+#             
+#             results = client.query_points(
+#                 collection_name=COLLECTION_NAME,
+#                 prefetch=prefetch,
+#                 query=late_vectors,
+#                 using="colbertv2.0",
+#                 with_payload=True,
+#                 limit=10
+#             )
+#             
+#             # Parse results
+#             points = getattr(results, "points", [])
+#             app_log.info(f"Points retrieved for '{q[:20]}...': {len(points)}")
+#             colbert_docs = []
+#             for point in points:
+#                 payload = getattr(point, "payload", {}) or {}
+#                 meta = payload.get("metadata", {})
+#                 content = (payload.get("content") or "").strip()
+#                 colbert_docs.append({
+#                     "id": getattr(point, "id", ""),
+#                     "chapter_number": meta.get("chapter_number", ""),
+#                     "chapter": meta.get("chapter", ""),
+#                     "article_no": meta.get("article_no", ""),
+#                     "article_title": meta.get("article_title", ""),
+#                     "clause_no": meta.get("clause_no", ""),
+#                     "point_letter": meta.get("point_letter", ""),
+#                     "content": content,
+#                     "colbert_score": getattr(point, "score", 0.0),
+#                 })
+#                 app_log.debug(f"Doc content: {content[:100]}...")
+#             return colbert_docs
+#         
+#         # Chạy song song 2 hybrid searches
+#         docs_a_task = asyncio.create_task(hybrid_for_query(original_query))
+#         docs_b_task = asyncio.create_task(hybrid_for_query(normalized_query))
+#         docs_a = await docs_a_task
+#         docs_b = await docs_b_task
+#         
+#         # Merge: Gộp và loại trùng dựa trên id
+#         merged_docs = {}
+#         for doc in docs_a + docs_b:
+#             doc_id = doc.get("id")
+#             if doc_id and doc_id not in merged_docs:
+#                 merged_docs[doc_id] = doc
+#                 app_log.info(f"Merged doc ID {doc_id}: content {doc['content'][:100]}... score {doc['colbert_score']}")
+#         merged_list = list(merged_docs.values())
+#         
+#         # Chỉ lấy top_k docs theo colbert_score
+#         selected = sorted(merged_list, key=lambda x: x.get("colbert_score", 0.0), reverse=True)[:top_k]
+#         
+#         search_cache.set(cache_key, selected)
+#         app_log.info(f"RAG ensemble done: {len(selected)} docs (A={len(docs_a)}, B={len(docs_b)}, Merged={len(merged_list)})")
+#         
+#         return [], [], selected
+#     except Exception as e:
+#         app_log.error(f"RAG search ensemble lỗi: {e}", exc_info=True)
+#         return [], [], []
+
+# ===== NEW FLOW: Dense + Sparse + RRF =====
+def reciprocal_rank_fusion(dense_docs: List[Dict], sparse_docs: List[Dict], k: int = 60, top_k: int = 10) -> List[Dict]:
+    """
+    Reciprocal Rank Fusion (RRF) để merge kết quả từ Dense và Sparse search
+    Formula: RRF_score(doc) = sum(1 / (k + rank_i)) for all rankings
+    """
+    rrf_scores = {}
+    doc_map = {}
     
-    cache_key = f"search|{COLLECTION_NAME}|{top_k}|{score_threshold}|{original_query}|{normalized_query}"
+    # Score từ Dense search
+    for rank, doc in enumerate(dense_docs, start=1):
+        doc_id = doc.get("id")
+        if doc_id:
+            rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + (1.0 / (k + rank))
+            doc_map[doc_id] = doc
+    
+    # Score từ Sparse search
+    for rank, doc in enumerate(sparse_docs, start=1):
+        doc_id = doc.get("id")
+        if doc_id:
+            rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + (1.0 / (k + rank))
+            if doc_id not in doc_map:
+                doc_map[doc_id] = doc
+    
+    # Sắp xếp theo RRF score
+    sorted_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
+    
+    # Tạo danh sách kết quả
+    results = []
+    for doc_id in sorted_ids[:top_k]:
+        doc = doc_map[doc_id].copy()
+        doc["rrf_score"] = rrf_scores[doc_id]
+        results.append(doc)
+    
+    app_log.info(f"RRF fusion: {len(dense_docs)} dense + {len(sparse_docs)} sparse → {len(results)} merged")
+    return results
+
+@log_time
+async def search_law(original_query: str, normalized_query: str, top_k: int = 10):
+    """
+    NEW FLOW: Dense (20) + Sparse (10) search song song, sau đó RRF fusion → top_k
+    CHỈ chạy với original_query (normalized_query bị comment)
+    """
+    app_log.info(f"RAG search (Dense+Sparse+RRF): original={_safe_truncate(original_query, 80)}")
+    
+    cache_key = f"search_v2|{COLLECTION_NAME}|{top_k}|{original_query}"
     cached = search_cache.get(cache_key)
     if cached is not None:
         app_log.info("Cache hit ✅")
         return [], [], cached
     
     try:
-        # Hàm helper để chạy hybrid search cho một query
-        async def hybrid_for_query(q: str) -> List[Dict]:
-            # Embeddings
-            dense_vectors = dense_embedding_model.encode(q).tolist()  # Ensure list[float]
-            sparse_vectors = next(sparse_embedding_model.query_embed(q))
-            late_vectors = next(late_interaction_embedding_model.query_embed(q))
-            
-            # Hybrid search với ColBERT
+        # Helper function: Dense + Sparse search cho 1 query
+        async def hybrid_search_for_query(q: str) -> tuple[List[Dict], List[Dict]]:
+            """Trả về (dense_docs, sparse_docs)"""
+            # 1. Dense search (top 20)
+            dense_vectors = dense_embedding_model.encode(q).tolist()
             from qdrant_client import models
-            prefetch = [
-                models.Prefetch(query=dense_vectors, using="bge-m3", limit=100),  # FIX: Increase for more recall
-                models.Prefetch(
-                    query=models.SparseVector(
-                        indices=sparse_vectors.indices.tolist(),
-                        values=sparse_vectors.values.tolist(),
-                    ),
-                    using="bm25",
-                    limit=100  # FIX: Increase
-                )
-            ]
             
-            results = client.query_points(
+            dense_results = client.query_points(
                 collection_name=COLLECTION_NAME,
-                prefetch=prefetch,
-                query=late_vectors,
-                using="colbertv2.0",
-                with_payload=True,
-                limit=50  # FIX: Increase limit
+                query=dense_vectors,
+                using="bge-m3",
+                limit=20,
+                with_payload=True
             )
             
-            # Parse results
-            points = getattr(results, "points", [])
-            app_log.info(f"Points retrieved for '{q[:20]}...': {len(points)}")
-            colbert_docs = []
+            dense_docs = []
+            points = getattr(dense_results, "points", [])
             for point in points:
                 payload = getattr(point, "payload", {}) or {}
                 meta = payload.get("metadata", {})
-                content = (payload.get("content") or "").strip()
-                colbert_docs.append({
+                dense_docs.append({
                     "id": getattr(point, "id", ""),
                     "chapter_number": meta.get("chapter_number", ""),
                     "chapter": meta.get("chapter", ""),
@@ -414,42 +529,85 @@ async def search_law(original_query: str, normalized_query: str, top_k: int = 10
                     "article_title": meta.get("article_title", ""),
                     "clause_no": meta.get("clause_no", ""),
                     "point_letter": meta.get("point_letter", ""),
-                    "content": content,
-                    "colbert_score": getattr(point, "score", 0.0),
+                    "content": (payload.get("content") or "").strip(),
+                    "dense_score": getattr(point, "score", 0.0),
                 })
-                app_log.debug(f"Doc content: {content[:100]}...")  # ADD: Log snippet of content for debug
-            return colbert_docs
+            
+            # 2. Sparse search (top 10)
+            sparse_vectors = next(sparse_embedding_model.query_embed(q))
+            
+            sparse_results = client.query_points(
+                collection_name=COLLECTION_NAME,
+                query=models.SparseVector(
+                    indices=sparse_vectors.indices.tolist(),
+                    values=sparse_vectors.values.tolist(),
+                ),
+                using="bm25",
+                limit=10,
+                with_payload=True
+            )
+            
+            sparse_docs = []
+            points = getattr(sparse_results, "points", [])
+            for point in points:
+                payload = getattr(point, "payload", {}) or {}
+                meta = payload.get("metadata", {})
+                sparse_docs.append({
+                    "id": getattr(point, "id", ""),
+                    "chapter_number": meta.get("chapter_number", ""),
+                    "chapter": meta.get("chapter", ""),
+                    "article_no": meta.get("article_no", ""),
+                    "article_title": meta.get("article_title", ""),
+                    "clause_no": meta.get("clause_no", ""),
+                    "point_letter": meta.get("point_letter", ""),
+                    "content": (payload.get("content") or "").strip(),
+                    "sparse_score": getattr(point, "score", 0.0),
+                })
+            
+            app_log.info(f"Query '{q[:30]}...': Dense={len(dense_docs)}, Sparse={len(sparse_docs)}")
+            return dense_docs, sparse_docs
         
-        # Chạy song song 2 hybrid searches
-        docs_a_task = asyncio.create_task(hybrid_for_query(original_query))
-        docs_b_task = asyncio.create_task(hybrid_for_query(normalized_query))
-        docs_a = await docs_a_task
-        docs_b = await docs_b_task
+        # CHỈ chạy cho original_query (COMMENT normalized_query)
+        dense_docs, sparse_docs = await hybrid_search_for_query(original_query)
         
-        # Merge: Gộp và loại trùng dựa trên id
-        merged_docs = {}
-        for doc in docs_a + docs_b:
-            doc_id = doc.get("id")
-            if doc_id and doc_id not in merged_docs:
-                merged_docs[doc_id] = doc
-                app_log.info(f"Merged doc ID {doc_id}: content {doc['content'][:100]}... score {doc['colbert_score']}")  # ADD: Log merged docs
-        merged_list = list(merged_docs.values())
+        # ===== COMMENTED: Multi-query ensemble với normalized_query =====
+        # task_a = asyncio.create_task(hybrid_search_for_query(original_query))
+        # task_b = asyncio.create_task(hybrid_search_for_query(normalized_query))
+        # 
+        # (dense_a, sparse_a) = await task_a
+        # (dense_b, sparse_b) = await task_b
+        # 
+        # # Merge kết quả từ 2 queries (loại trùng)
+        # all_dense = {}
+        # for doc in dense_a + dense_b:
+        #     doc_id = doc.get("id")
+        #     if doc_id and doc_id not in all_dense:
+        #         all_dense[doc_id] = doc
+        # 
+        # all_sparse = {}
+        # for doc in sparse_a + sparse_b:
+        #     doc_id = doc.get("id")
+        #     if doc_id and doc_id not in all_sparse:
+        #         all_sparse[doc_id] = doc
+        # 
+        # # RRF fusion
+        # dense_list = list(all_dense.values())
+        # sparse_list = list(all_sparse.values())
         
-        # BAAI rerank cuối cùng với original_query
-        if merged_list:
-            selected = rerank_with_baai(original_query, merged_list, top_k=top_k)
-            # selected = [doc for doc in selected if doc.get("baai_score", 0.0) >= score_threshold]  # TEMP: Comment to keep all for debug
-            if not selected:
-                app_log.warning("All docs filtered out by threshold; raw scores: " + str([d.get('baai_score') for d in selected]))
-        else:
-            selected = []
+        # Sắp xếp theo score trước khi RRF
+        dense_list = sorted(dense_docs, key=lambda x: x.get("dense_score", 0.0), reverse=True)
+        sparse_list = sorted(sparse_docs, key=lambda x: x.get("sparse_score", 0.0), reverse=True)
+        
+        selected = reciprocal_rank_fusion(dense_list, sparse_list, k=60, top_k=top_k)
         
         search_cache.set(cache_key, selected)
-        app_log.info(f"RAG ensemble done: {len(selected)} docs (A={len(docs_a)}, B={len(docs_b)}, Merged={len(merged_list)})")
+        app_log.info(f"RRF done: {len(selected)} final docs")
         
-        return [], [], selected
+        # Return format: (bm25_docs, emb_docs, final_docs)
+        return sparse_list[:5], dense_list[:5], selected
+        
     except Exception as e:
-        app_log.error(f"RAG search ensemble lỗi: {e}", exc_info=True)
+        app_log.error(f"RAG search lỗi: {e}", exc_info=True)
         return [], [], []
 # =========================
 # QUERY ROUTING (thay thế Intent Analysis)
@@ -596,7 +754,8 @@ def docs_to_markdown(docs: List[Dict[str, Any]]) -> str:
         clause_no = doc.get("clause_no", "")
         point_letter = doc.get("point_letter", "")
         content = doc.get("content", "")[:150]
-        score = doc.get("baai_score") or doc.get("colbert_score") or doc.get("score", 0.0)
+        # Lấy score phù hợp với loại search
+        score = doc.get("rrf_score") or doc.get("dense_score") or doc.get("sparse_score") or doc.get("baai_score") or doc.get("colbert_score") or doc.get("score", 0.0)
         
         citation_parts = []
         if article_no:
@@ -640,7 +799,8 @@ def docs_page_markdown(docs: List[Dict[str, Any]], page: int, page_size: int) ->
         clause_no = doc.get("clause_no", "")
         point_letter = doc.get("point_letter", "")
         content = doc.get("content", "")
-        score = doc.get("baai_score") or doc.get("colbert_score") or doc.get("score", 0.0)
+        # Lấy score phù hợp với loại search
+        score = doc.get("rrf_score") or doc.get("dense_score") or doc.get("sparse_score") or doc.get("baai_score") or doc.get("colbert_score") or doc.get("score", 0.0)
         
         citation_parts = []
         if article_no:
@@ -818,7 +978,7 @@ def ui_return(msg_val, chatbot_val, bm25_val, emb_val, cites_val, last_answer_va
 # MAIN RESPONSE GENERATOR (REFACTORED - NO INTENT)
 # =========================
 @log_time
-def respond_generator(message, history_msgs, cur_page_size, k=15, temperature=0.2, threshold=0.42):
+def respond_generator(message, history_msgs, cur_page_size, k=15, temperature=0.2):
     """
     Luồng xử lý chính - ĐÃ LOẠI BỎ INTENT ANALYSIS
     """
@@ -956,14 +1116,15 @@ def respond_generator(message, history_msgs, cur_page_size, k=15, temperature=0.
                 # Rewrite query trước khi RAG
                 try:
                     search_query = rewrite_query(search_query)
-                except Exception:
-                    pass
+                except Exception as e:
+                    app_log.warning(f"Rewrite lỗi trong FETCH fallback: {e}, dùng original query")
+                    search_query = message  # Fallback to original query
                 
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
                     bm25_docs, emb_docs, docs = loop.run_until_complete(
-                        search_law(original_query=message, normalized_query=search_query, top_k=int(k), score_threshold=float(threshold))
+                        search_law(original_query=message, normalized_query=search_query, top_k=int(k))
                     )
                 finally:
                     loop.close()
@@ -975,14 +1136,15 @@ def respond_generator(message, history_msgs, cur_page_size, k=15, temperature=0.
             # Rewrite query
             try:
                 search_query = rewrite_query(search_query)
-            except Exception:
-                pass
+            except Exception as e:
+                app_log.warning(f"Rewrite lỗi trong RAG_SEARCH: {e}, dùng original query")
+                search_query = message  # Fallback to original query
             
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
                 bm25_docs, emb_docs, docs = loop.run_until_complete(
-                    search_law(original_query=message, normalized_query=search_query, top_k=int(k), score_threshold=float(threshold))
+                    search_law(original_query=message, normalized_query=search_query, top_k=int(k))
                 )
             finally:
                 loop.close()
@@ -997,15 +1159,16 @@ def respond_generator(message, history_msgs, cur_page_size, k=15, temperature=0.
             # Rewrite query
             try:
                 search_query = rewrite_query(search_query)
-            except Exception:
-                pass
+            except Exception as e:
+                app_log.warning(f"Rewrite lỗi trong HYBRID: {e}, dùng original query")
+                search_query = message  # Fallback to original query
             
             # RAG search
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
                 bm25_docs, emb_docs, rag_docs = loop.run_until_complete(
-                    search_law(original_query=message, normalized_query=search_query, top_k=int(k) // 2, score_threshold=float(threshold))
+                    search_law(original_query=message, normalized_query=search_query, top_k=int(k) // 2)
                 )
             finally:
                 loop.close()
@@ -1126,7 +1289,8 @@ def respond_generator(message, history_msgs, cur_page_size, k=15, temperature=0.
         )
 
 def respond_wrapper(message, history_msgs, cur_page_size, k=15, temperature=0.2, threshold=0.42):
-    for output in respond_generator(message, history_msgs, cur_page_size, k, temperature, threshold):
+    # Note: threshold parameter kept for backward compatibility but not used
+    for output in respond_generator(message, history_msgs, cur_page_size, k, temperature):
         yield output
 
 # =========================
