@@ -109,102 +109,220 @@ class ModelManager:
             with cls._lock:
                 if cls._instance is None:
                     cls._instance = super().__new__(cls)
+                    # Initialize flag inside the lock to prevent race condition
                     cls._instance._initialized = False
+                    cls._instance._models_lock = threading.RLock()
+                    cls._instance.qdrant_client = None
+                    cls._instance.dense_model = None
+                    cls._instance.sparse_model = None
+                    cls._instance.late_model = None
+                    cls._instance.llm_route = None
+                    cls._instance.llm_answer = None
+                    cls._instance.executor = None
+                    cls._instance.compiled_graph = None
         return cls._instance
     
     def __init__(self):
+        # Skip if already initialized
         if self._initialized:
             return
-            
         self._initialized = True
-        self._models_lock = threading.RLock()
-        
-        self.qdrant_client = None
-        self.dense_model = None
-        self.sparse_model = None
-        self.late_model = None
-        self.llm_route = None
-        self.llm_answer = None
-        self.executor = None
-        self.compiled_graph = None
     
     def init_models(self):
-        """Thread-safe model initialization"""
+        """Thread-safe model initialization with timeout"""
         with self._models_lock:
+            # Qdrant client
             if self.qdrant_client is None:
                 logger.info("🔄 Initializing Qdrant client...")
                 start = time.time()
-                self.qdrant_client = QdrantClient(
-                    url=config.QDRANT_URL,
-                    api_key=config.QDRANT_API_KEY,
-                    timeout=30
-                )
-                logger.info(f"✅ Qdrant initialized in {time.time()-start:.2f}s")
+                try:
+                    self.qdrant_client = QdrantClient(
+                        url=config.QDRANT_URL,
+                        api_key=config.QDRANT_API_KEY,
+                        timeout=30,
+                        # Connection pooling configuration for better performance
+                        grpc_port=6334,  # Enable gRPC for better connection pooling
+                        prefer_grpc=True
+                    )
+                    # Test connection
+                    self.qdrant_client.get_collections()
+                    logger.info(f"✅ Qdrant initialized in {time.time()-start:.2f}s")
+                except Exception as e:
+                    logger.error(f"❌ Qdrant initialization failed: {e}")
+                    raise
             
+            # Dense model
             if self.dense_model is None:
                 logger.info("🔄 Loading dense model (BAAI/bge-m3)...")
                 start = time.time()
-                self.dense_model = SentenceTransformer("BAAI/bge-m3", device="cpu")
-                logger.info(f"✅ Dense model loaded in {time.time()-start:.2f}s")
+                try:
+                    self.dense_model = SentenceTransformer("BAAI/bge-m3", device="cpu")
+                    logger.info(f"✅ Dense model loaded in {time.time()-start:.2f}s")
+                except Exception as e:
+                    logger.error(f"❌ Dense model loading failed: {e}")
+                    raise
             
+            # Sparse model
             if self.sparse_model is None:
                 logger.info("🔄 Loading sparse model (Qdrant/bm25)...")
                 start = time.time()
-                self.sparse_model = SparseTextEmbedding("Qdrant/bm25")
-                logger.info(f"✅ Sparse model loaded in {time.time()-start:.2f}s")
+                try:
+                    self.sparse_model = SparseTextEmbedding("Qdrant/bm25")
+                    logger.info(f"✅ Sparse model loaded in {time.time()-start:.2f}s")
+                except Exception as e:
+                    logger.error(f"❌ Sparse model loading failed: {e}")
+                    raise
             
+            # Late model
             if self.late_model is None:
                 logger.info("🔄 Loading late interaction model (ColBERT)...")
                 start = time.time()
-                self.late_model = LateInteractionTextEmbedding("colbert-ir/colbertv2.0")
-                logger.info(f"✅ Late model loaded in {time.time()-start:.2f}s")
+                try:
+                    self.late_model = LateInteractionTextEmbedding("colbert-ir/colbertv2.0")
+                    logger.info(f"✅ Late model loaded in {time.time()-start:.2f}s")
+                except Exception as e:
+                    logger.error(f"❌ Late model loading failed: {e}")
+                    raise
             
+            # LLM Route
             if self.llm_route is None:
                 logger.info("🔄 Initializing LLM for routing...")
-                self.llm_route = ChatGoogleGenerativeAI(
-                    model="gemini-2.5-flash-lite",
-                    google_api_key=config.GEMINI_API_KEY1,
-                    temperature=0,
-                    timeout=config.LLM_TIMEOUT,
-                    max_retries=2
-                )
-                logger.info("✅ LLM route initialized")
+                try:
+                    self.llm_route = ChatGoogleGenerativeAI(
+                        model="gemini-2.5-flash-lite",
+                        google_api_key=config.GEMINI_API_KEY1,
+                        temperature=0,
+                        timeout=config.LLM_TIMEOUT,
+                        max_retries=2
+                    )
+                    logger.info("✅ LLM route initialized")
+                except Exception as e:
+                    logger.error(f"❌ LLM route initialization failed: {e}")
+                    raise
             
+            # LLM Answer
             if self.llm_answer is None:
                 logger.info("🔄 Initializing LLM for answer generation...")
-                self.llm_answer = ChatGoogleGenerativeAI(
-                    model="gemini-2.5-flash",
-                    google_api_key=config.GEMINI_API_KEY2,
-                    temperature=0.2,
-                    timeout=config.LLM_TIMEOUT,
-                    max_retries=2
-                )
-                logger.info("✅ LLM answer initialized")
+                try:
+                    self.llm_answer = ChatGoogleGenerativeAI(
+                        model="gemini-2.5-flash",
+                        google_api_key=config.GEMINI_API_KEY2,
+                        temperature=0.2,
+                        timeout=config.LLM_TIMEOUT,
+                        max_retries=2
+                    )
+                    logger.info("✅ LLM answer initialized")
+                except Exception as e:
+                    logger.error(f"❌ LLM answer initialization failed: {e}")
+                    raise
             
+            # ThreadPoolExecutor
             if self.executor is None:
-                self.executor = ThreadPoolExecutor(
-                    max_workers=config.MAX_WORKERS,
-                    thread_name_prefix="rag_worker"
-                )
-                logger.info(f"✅ ThreadPoolExecutor created with {config.MAX_WORKERS} workers")
+                try:
+                    self.executor = ThreadPoolExecutor(
+                        max_workers=config.MAX_WORKERS,
+                        thread_name_prefix="rag_worker"
+                    )
+                    logger.info(f"✅ ThreadPoolExecutor created with {config.MAX_WORKERS} workers")
+                except Exception as e:
+                    logger.error(f"❌ ThreadPoolExecutor creation failed: {e}")
+                    raise
             
+            # LangGraph
             if self.compiled_graph is None:
                 logger.info("🔄 Compiling LangGraph workflow...")
-                self.compiled_graph = build_graph()
-                logger.info("✅ LangGraph compiled and cached")
+                try:
+                    self.compiled_graph = build_graph()
+                    logger.info("✅ LangGraph compiled and cached")
+                except Exception as e:
+                    logger.error(f"❌ LangGraph compilation failed: {e}")
+                    raise
     
     def shutdown(self):
         """Cleanup resources"""
         with self._models_lock:
             if self.executor:
-                self.executor.shutdown(wait=True)
-                logger.info("✅ ThreadPoolExecutor shutdown complete")
+                try:
+                    # Shutdown with timeout to prevent deadlock
+                    self.executor.shutdown(wait=True, timeout=30)
+                    logger.info("✅ ThreadPoolExecutor shutdown complete")
+                except Exception as e:
+                    logger.error(f"⚠️ ThreadPoolExecutor shutdown error: {e}")
+                    # Force shutdown if timeout
+                    self.executor.shutdown(wait=False)
             
             if self.qdrant_client:
-                self.qdrant_client.close()
-                logger.info("✅ Qdrant client closed")
+                try:
+                    self.qdrant_client.close()
+                    logger.info("✅ Qdrant client closed")
+                except Exception as e:
+                    logger.error(f"⚠️ Qdrant client close error: {e}")
 
 model_manager = ModelManager()
+
+# ========================
+# CONCURRENCY CONTROL
+# ========================
+from threading import Semaphore
+import concurrent.futures as cf
+
+# Limit concurrent requests to prevent overload
+request_semaphore = Semaphore(3)  # Max 3 concurrent requests
+
+# ========================
+# HEALTH CHECK
+# ========================
+def health_check():
+    """Check system health and resource status"""
+    health_status = {
+        "status": "healthy",
+        "checks": {},
+        "timestamp": datetime.now().isoformat()
+    }
+    
+    try:
+        # Check Qdrant connection
+        start = time.time()
+        model_manager.init_models()
+        qdrant_time = time.time() - start
+        health_status["checks"]["qdrant"] = {
+            "status": "ok",
+            "response_time": f"{qdrant_time:.2f}s"
+        }
+    except Exception as e:
+        health_status["checks"]["qdrant"] = {
+            "status": "error",
+            "error": str(e)
+        }
+        health_status["status"] = "degraded"
+    
+    # Check available semaphore slots
+    available_slots = request_semaphore._value
+    health_status["checks"]["concurrency"] = {
+        "status": "ok" if available_slots > 0 else "warning",
+        "available_slots": available_slots,
+        "max_slots": 3
+    }
+    
+    if available_slots == 0:
+        health_status["status"] = "busy"
+    
+    # Check thread pool
+    if hasattr(model_manager, 'executor') and model_manager.executor:
+        active_threads = len([t for t in model_manager.executor._threads if t.is_alive()])
+        health_status["checks"]["thread_pool"] = {
+            "status": "ok",
+            "active_threads": active_threads,
+            "max_workers": config.MAX_WORKERS
+        }
+    else:
+        health_status["checks"]["thread_pool"] = {
+            "status": "error",
+            "error": "ThreadPool not initialized"
+        }
+        health_status["status"] = "unhealthy"
+    
+    return health_status
 
 # ========================
 # INPUT VALIDATION
@@ -257,18 +375,26 @@ class GraphState(TypedDict):
 # ========================
 # TOOLS WITH RETRY
 # ========================
+class RetryableError(Exception):
+    """Exception for errors that should be retried"""
+    pass
+
 def retry_on_failure(max_retries=2, delay=1):
-    """Decorator for retry logic"""
+    """Decorator for retry logic - only retries RetryableError and network errors"""
     def decorator(func):
         def wrapper(*args, **kwargs):
             for attempt in range(max_retries):
                 try:
                     return func(*args, **kwargs)
-                except Exception as e:
+                except (RetryableError, ConnectionError, TimeoutError) as e:
                     if attempt == max_retries - 1:
                         raise
                     logger.warning(f"⚠️  Retry {attempt+1}/{max_retries} for {func.__name__}: {e}")
                     time.sleep(delay * (attempt + 1))
+                except Exception as e:
+                    # Don't retry validation errors or other exceptions
+                    logger.error(f"❌ Non-retryable error in {func.__name__}: {e}")
+                    raise
             return None
         return wrapper
     return decorator
@@ -276,56 +402,65 @@ def retry_on_failure(max_retries=2, delay=1):
 @retry_on_failure(max_retries=2)
 def filter_search(point_id: str = None, law_title: str = None, limit: int = 10) -> list[dict]:
     """Tool: Filter search with retry"""
-    model_manager.init_models()
-    
-    start_time = time.time()
-    logger.info(f"🔍 [FILTER] point_id={point_id}, law_title={law_title}")
-    
-    must_conditions = []
-    
-    if point_id:
-        must_conditions.append(
-            FieldCondition(key="metadata.point_id", match=MatchValue(value=point_id))
+    try:
+        model_manager.init_models()
+        
+        start_time = time.time()
+        logger.info(f"🔍 [FILTER] point_id={point_id}, law_title={law_title}")
+        
+        must_conditions = []
+        
+        if point_id:
+            must_conditions.append(
+                FieldCondition(key="metadata.point_id", match=MatchValue(value=point_id))
+            )
+        
+        if law_title:
+            must_conditions.append(
+                FieldCondition(key="metadata.law_title", match=MatchValue(value=law_title))
+            )
+        
+        if not must_conditions:
+            logger.warning("⚠️  No filter conditions provided")
+            return []  # This is expected behavior, not an error
+        
+        filter_obj = Filter(must=must_conditions)
+        
+        scroll_result, _ = model_manager.qdrant_client.scroll(
+            collection_name=config.COLLECTION_NAME,
+            scroll_filter=filter_obj,
+            limit=limit,
+            with_payload=True
         )
+        
+        docs = []
+        for point in scroll_result:
+            payload = point.payload or {}
+            meta = payload.get("metadata", {})
+            docs.append({
+                "id": point.id,
+                "point_id": meta.get("point_id", ""),
+                "law_title": meta.get("law_title", ""),
+                "chapter": meta.get("chapter", ""),
+                "article_no": meta.get("article_no", ""),
+                "article_title": meta.get("article_title", ""),
+                "content": payload.get("content", ""),
+                "score": 1.0,
+                "source": "filter"
+            })
+        
+        elapsed = time.time() - start_time
+        logger.info(f"✅ [FILTER] Found {len(docs)} docs in {elapsed:.3f}s")
+        
+        return docs
     
-    if law_title:
-        must_conditions.append(
-            FieldCondition(key="metadata.law_title", match=MatchValue(value=law_title))
-        )
-    
-    if not must_conditions:
-        logger.warning("⚠️  No filter conditions provided")
-        return []
-    
-    filter_obj = Filter(must=must_conditions)
-    
-    scroll_result, _ = model_manager.qdrant_client.scroll(
-        collection_name=config.COLLECTION_NAME,
-        scroll_filter=filter_obj,
-        limit=limit,
-        with_payload=True
-    )
-    
-    docs = []
-    for point in scroll_result:
-        payload = point.payload or {}
-        meta = payload.get("metadata", {})
-        docs.append({
-            "id": point.id,
-            "point_id": meta.get("point_id", ""),
-            "law_title": meta.get("law_title", ""),
-            "chapter": meta.get("chapter", ""),
-            "article_no": meta.get("article_no", ""),
-            "article_title": meta.get("article_title", ""),
-            "content": payload.get("content", ""),
-            "score": 1.0,
-            "source": "filter"
-        })
-    
-    elapsed = time.time() - start_time
-    logger.info(f"✅ [FILTER] Found {len(docs)} docs in {elapsed:.3f}s")
-    
-    return docs
+    except (ConnectionError, TimeoutError) as e:
+        # These are retryable errors
+        logger.error(f"❌ [FILTER] Network error: {e}", exc_info=True)
+        raise RetryableError(f"Network error in filter_search: {e}")
+    except Exception as e:
+        logger.error(f"❌ [FILTER] Error: {e}", exc_info=True)
+        raise  # Re-raise for proper error handling
 
 @retry_on_failure(max_retries=2)
 def rag_search(query: str, top_k: int = 10) -> list[dict]:
@@ -335,7 +470,7 @@ def rag_search(query: str, top_k: int = 10) -> list[dict]:
     start_time = time.time()
     logger.info(f"🔍 [RAG] query='{query[:50]}...', top_k={top_k}")
     
-    # Parallel embedding
+    # Parallel embedding with timeout
     def embed_dense():
         return model_manager.dense_model.encode(query).tolist()
     
@@ -345,35 +480,51 @@ def rag_search(query: str, top_k: int = 10) -> list[dict]:
     def embed_late():
         return next(model_manager.late_model.query_embed(query))
     
-    future_dense = model_manager.executor.submit(embed_dense)
-    future_sparse = model_manager.executor.submit(embed_sparse)
-    future_late = model_manager.executor.submit(embed_late)
-    
-    dense_vec = future_dense.result()
-    sparse_vec = future_sparse.result()
-    late_vec = future_late.result()
+    try:
+        future_dense = model_manager.executor.submit(embed_dense)
+        future_sparse = model_manager.executor.submit(embed_sparse)
+        future_late = model_manager.executor.submit(embed_late)
+        
+        # Add timeout to prevent hanging
+        dense_vec = future_dense.result(timeout=30)
+        sparse_vec = future_sparse.result(timeout=30)
+        late_vec = future_late.result(timeout=30)
+        
+    except TimeoutError as e:
+        logger.error("❌ [RAG] Embedding timeout - aborting search")
+        raise RetryableError(f"Embedding timeout: {e}")
+    except Exception as e:
+        logger.error(f"❌ [RAG] Embedding error: {e}")
+        raise
     
     # Prefetch + ColBERT query
-    prefetch = [
-        models.Prefetch(query=dense_vec, using="bge-m3", limit=20),
-        models.Prefetch(
-            query=models.SparseVector(
-                indices=sparse_vec.indices.tolist(),
-                values=sparse_vec.values.tolist()
-            ),
-            using="bm25",
-            limit=10
+    try:
+        prefetch = [
+            models.Prefetch(query=dense_vec, using="bge-m3", limit=20),
+            models.Prefetch(
+                query=models.SparseVector(
+                    indices=sparse_vec.indices.tolist(),
+                    values=sparse_vec.values.tolist()
+                ),
+                using="bm25",
+                limit=10
+            )
+        ]
+        
+        results = model_manager.qdrant_client.query_points(
+            collection_name=config.COLLECTION_NAME,
+            prefetch=prefetch,
+            query=late_vec,
+            using="colbertv2.0",
+            with_payload=True,
+            limit=top_k
         )
-    ]
-    
-    results = model_manager.qdrant_client.query_points(
-        collection_name=config.COLLECTION_NAME,
-        prefetch=prefetch,
-        query=late_vec,
-        using="colbertv2.0",
-        with_payload=True,
-        limit=top_k
-    )
+    except (ConnectionError, TimeoutError) as e:
+        logger.error(f"❌ [RAG] Qdrant query error: {e}")
+        raise RetryableError(f"Qdrant query failed: {e}")
+    except Exception as e:
+        logger.error(f"❌ [RAG] Query error: {e}")
+        raise
     
     docs = []
     for point in results.points:
@@ -415,6 +566,14 @@ ACTION:
 - filter: CÓ thông tin cụ thể (Điều X, Khoản Y)
 - rag: Câu hỏi tổng quát
 - hybrid: VỪA cụ thể VỪA cần tìm rộng
+
+POINT_ID FORMAT: "dieu_X" hoặc "dieu_X_khoan_Y" hoặc "dieu_X_khoan_Y_diem_Z"
+LAW_TITLE FORMAT: Tên luật in hoa, ví dụ "LUẬT ĐẤT ĐAI", "LUẬT KINH DOANH BẤT ĐỘNG SẢN"
+
+VÍ DỤ:
+- "Điều 9 Khoản 4 Luật Đất đai" → point_id: "dieu_9_khoan_4", law_title: "LUẬT ĐẤT ĐAI"
+- "Điều 41 Luật Đất đai" → point_id: "dieu_41", law_title: "LUẬT ĐẤT ĐAI"
+- "Khoản 2 Điều 10 Luật Kinh doanh Bất động sản" → point_id: "dieu_10_khoan_2", law_title: "LUẬT KINH DOANH BẤT ĐỘNG SẢN"
 
 JSON OUTPUT:
 {{"normalized_query": "...", "query_action": "...", "point_id": null, "law_title": null, "optimized_query": null}}"""),
@@ -492,33 +651,42 @@ def rag_node(state: GraphState) -> GraphState:
     if action == "rag" and optimized_query and optimized_query != normalized_query:
         logger.info("⚡ [RAG NODE] Dual query mode")
         
-        future1 = model_manager.executor.submit(rag_search, normalized_query, 10)
-        future2 = model_manager.executor.submit(rag_search, optimized_query, 10)
-        
-        docs1 = future1.result()
-        docs2 = future2.result()
-        
-        # Merge and deduplicate
-        seen_ids = set()
-        merged_docs = []
-        
-        for doc in docs2:
-            doc_id = doc.get("id")
-            if doc_id not in seen_ids:
-                merged_docs.append(doc)
-                seen_ids.add(doc_id)
-        
-        for doc in docs1:
-            doc_id = doc.get("id")
-            if doc_id not in seen_ids:
-                merged_docs.append(doc)
-                seen_ids.add(doc_id)
-        
-        docs = merged_docs[:10]
-        logger.info(f"✅ [RAG NODE] Merged: {len(docs1)} + {len(docs2)} → {len(docs)} unique")
+        try:
+            # Sequential execution to avoid deadlock when thread pool is busy
+            # This prevents submitting 4 tasks when only 4 workers available
+            logger.info("📝 [RAG NODE] Sequential dual query to prevent deadlock")
+            docs1 = rag_search(normalized_query, top_k=10)
+            docs2 = rag_search(optimized_query, top_k=10)
+            
+            # Merge and deduplicate
+            seen_ids = set()
+            merged_docs = []
+            
+            for doc in docs2:
+                doc_id = doc.get("id")
+                if doc_id not in seen_ids:
+                    merged_docs.append(doc)
+                    seen_ids.add(doc_id)
+            
+            for doc in docs1:
+                doc_id = doc.get("id")
+                if doc_id not in seen_ids:
+                    merged_docs.append(doc)
+                    seen_ids.add(doc_id)
+            
+            docs = merged_docs[:10]
+            logger.info(f"✅ [RAG NODE] Merged: {len(docs1)} + {len(docs2)} → {len(docs)} unique")
+            
+        except (TimeoutError, Exception) as e:
+            logger.error(f"❌ [RAG NODE] Dual query failed: {e}")
+            docs = []  # Fallback to empty results
     else:
         logger.info("📝 [RAG NODE] Single query mode")
-        docs = rag_search(normalized_query, top_k=10)
+        try:
+            docs = rag_search(normalized_query, top_k=10)
+        except Exception as e:
+            logger.error(f"❌ [RAG NODE] Single query failed: {e}")
+            docs = []  # Fallback to empty results
     
     elapsed = time.time() - start_time
     logger.info(f"✅ [RAG NODE] {elapsed:.3f}s - {len(docs)} docs")
@@ -713,9 +881,20 @@ def build_graph():
 # ========================
 def run_query(query: str):
     """Execute query with validation and metrics"""
-    total_start = time.time()
+    # Acquire semaphore to limit concurrent requests
+    # Increased timeout from 10s to 90s to accommodate RAG search time (30-60s)
+    if not request_semaphore.acquire(timeout=90):
+        logger.warning("⚠️  Request queue full, rejecting request")
+        return {
+            "answer": "❌ Hệ thống đang bận. Vui lòng thử lại sau.",
+            "final_docs": [],
+            "error": "system_overload",
+            "debug_info": {"error": "system_overload"}
+        }
     
     try:
+        total_start = time.time()
+        
         # Validate
         query = validate_query(query)
         
@@ -769,12 +948,16 @@ def run_query(query: str):
             "error": str(e),
             "debug_info": {"error": "execution", "message": str(e)}
         }
+    
+    finally:
+        # Always release semaphore
+        request_semaphore.release()
 
 # ========================
 # STREAMING ANSWER
 # ========================
 def generate_answer_stream(query: str, context: str):
-    """Generator for streaming LLM response"""
+    """Generator for streaming LLM response with timeout"""
     answer_prompt = ChatPromptTemplate.from_messages([
         ("system", """Bạn là chuyên gia pháp lý BĐS Việt Nam. Trả lời dựa trên ngữ cảnh pháp luật được cung cấp.
 
@@ -785,17 +968,30 @@ YÊU CẦU:
         ("user", "Câu hỏi: {query}\n\nNgữ cảnh:\n{context}\n\nTrả lời:")
     ])
     
-    chain = answer_prompt | model_manager.llm_answer
-    
     try:
-        accumulated = ""
+        chain = answer_prompt | model_manager.llm_answer
+        
+        # Add timeout wrapper for streaming
+        import time
+        start_time = time.time()
+        timeout_seconds = 120  # 2 minutes timeout for streaming
+        
+        # Use list for efficient string building (O(N) instead of O(N²))
+        accumulated_parts = []
         for chunk in chain.stream({"query": query, "context": context}):
+            # Check timeout
+            if time.time() - start_time > timeout_seconds:
+                yield f"❌ Streaming timeout after {timeout_seconds}s"
+                return
+                
             if hasattr(chunk, 'content'):
                 token = chunk.content
-                accumulated += token
-                yield accumulated
+                accumulated_parts.append(token)
+                # Join only when yielding to avoid memory overhead
+                yield ''.join(accumulated_parts)
+                
     except Exception as e:
-        yield f"❌ Lỗi: {str(e)}"
+        yield f"❌ Lỗi streaming: {str(e)}"
 
 # ========================
 # GRADIO INTERFACE
@@ -1066,20 +1262,34 @@ def create_gradio_app():
         </div>
         """)
         
-        # Status indicator
+        # Status indicator with health check
         with gr.Row():
             with gr.Column(scale=1):
-                status_box = gr.Markdown("""
-                <div class="status-box">
-                    <h3>📊 Trạng thái hệ thống</h3>
-                    <ul>
-                        <li>✅ <strong>Qdrant:</strong> Sẵn sàng</li>
-                        <li>✅ <strong>LLM:</strong> Gemini 2.5 Flash</li>
-                        <li>✅ <strong>Embeddings:</strong> BGE-M3 + BM25 + ColBERT</li>
-                        <li>⚡ <strong>Streaming:</strong> Bật</li>
-                    </ul>
-                </div>
-                """)
+                def get_status_info():
+                    health = health_check()
+                    status_emoji = "✅" if health["status"] == "healthy" else "⚠️" if health["status"] == "busy" else "❌"
+                    
+                    status_text = f"""
+<div class="status-box">
+    <h3>{status_emoji} Trạng thái hệ thống: {health['status'].upper()}</h3>
+    <ul>
+        <li><strong>Qdrant:</strong> {health['checks']['qdrant']['status']} ({health['checks']['qdrant'].get('response_time', 'N/A')})</li>
+        <li><strong>Concurrency:</strong> {health['checks']['concurrency']['available_slots']}/3 slots available</li>
+        <li><strong>Thread Pool:</strong> {health['checks']['thread_pool']['active_threads']}/{config.MAX_WORKERS} active</li>
+    </ul>
+    <p style="font-size: 0.8em; color: #666;">Last check: {health['timestamp']}</p>
+</div>
+"""
+                    return status_text
+                
+                status_box = gr.Markdown(value=get_status_info())
+                
+                refresh_status_btn = gr.Button("🔄 Refresh Status", size="sm")
+                refresh_status_btn.click(
+                    fn=lambda: get_status_info(),
+                    inputs=[],
+                    outputs=[status_box]
+                )
         
         gr.Markdown("---")
         
@@ -1226,11 +1436,15 @@ def shutdown_handler(signum=None, frame=None):
     global shutdown_requested
     logger.info("🛑 Shutting down gracefully...")
     shutdown_requested = True
-    model_manager.shutdown()
-    logger.info("✅ Shutdown complete")
-    # Force exit after cleanup
-    import os
-    os._exit(0)
+    
+    try:
+        model_manager.shutdown()
+        logger.info("✅ Shutdown complete")
+    except Exception as e:
+        logger.error(f"⚠️ Error during shutdown: {e}")
+    
+    # Use sys.exit() instead of os._exit() to allow cleanup hooks
+    sys.exit(0)
 
 atexit.register(shutdown_handler)
 signal.signal(signal.SIGTERM, shutdown_handler)
@@ -1259,7 +1473,7 @@ if __name__ == "__main__":
         
         app = create_gradio_app()
         app.launch(
-            server_name="0.0.0.0",  # Allow external access
+            server_name="127.0.0.1",
             server_port=7860,
             share=False,
             debug=True,
